@@ -1,0 +1,17 @@
+[package]
+name = "jikan"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-rt = "2.10.0"
+chrono = "0.4.38"
+cron = "0.12.1"
+parking_lot = "0.12.3"
+redb = "2.1.1"
+rustpython-vm = "0.4.0"
+serde = { version = "1.0.208", features = ["derive"] }
+serde_yaml = "0.9.34"
+tokio = { version = "1.39.3", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

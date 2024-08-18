@@ -1,0 +1,17 @@
+name: workflow-now
+run-name: some-run-name
+on:
+  schedule:
+    # second minute hour day month * *
+    - cron: "0 0 19 18 8 * *"
+
+jobs:
+  some-job:
+    runs-on: bash
+    steps:
+      - run: echo "This is a test"
+  python-job:
+    runs-on: 
+      python-external: .venv/bin/python
+    steps:
+      - run: func.py

@@ -1,0 +1,8 @@
+/target
+jikan.redb
+
+workflows/*.yaml
+!workflows/workflow-now.yaml
+
+# avoid jikan_client for now
+jikan_client

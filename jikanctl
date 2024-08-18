@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# Function to send a command to the server
+send_command() {
+    echo "$1" | nc localhost 8080
+}
+
+# Check if a command was provided
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <command> [args]"
+    echo "Commands: ADD <name>, LIST, GET <name>, DELETE <name>"
+    exit 1
+fi
+
+# Combine all arguments into a single command string
+command="$*"
+
+# Send the command and display the response
+response=$(send_command "$command")
+echo "Server response: $response"
