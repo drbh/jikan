@@ -782,6 +782,80 @@ async fn delete_workflow(
     ))
 }
 
+#[instrument]
+async fn get_next_run_workflow(
+    namespace: &str,
+    name: &str,
+    db: &Arc<Mutex<Database>>,
+) -> std::io::Result<String> {
+    let db = db.lock().unwrap();
+    let read_txn = db.begin_read().map_err(|e| {
+        error!(error = %e, "Failed to begin read transaction");
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+    let table = read_txn.open_table(WORKFLOWS).map_err(|e| {
+        error!(error = %e, "Failed to open workflows table");
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
+    if let Some(workflow) = table.get((namespace, name)).map_err(|e| {
+        error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })? {
+        let config: JikanConfig = serde_yaml::from_str(workflow.value())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let job = WorkflowJob::new(config);
+        let cron = job.cron();
+        let s = if cron == "now" {
+            let now = Local::now();
+            let in_near_future = now + chrono::Duration::seconds(1);
+            time_to_cron(in_near_future)
+        } else {
+            cron.to_string()
+        };
+
+        match CronSchedule::from_str(&s) {
+            Ok(schedule) => {
+                let now = Local::now();
+                let (next_time, next_run) =
+                    schedule
+                        .upcoming(Local)
+                        .next()
+                        .map_or((now, "never".to_string()), |t| {
+                            let time_diff = t - now;
+                            let num_seconds = time_diff.num_seconds();
+                            (t, format!("{} seconds", num_seconds))
+                        });
+
+                info!(
+                    namespace = namespace,
+                    workflow = name,
+                    next_run = &next_run,
+                    "Next run calculated"
+                );
+                Ok(format!(
+                    "Workflow '{}' in namespace '{}' will run in {}.\nAbsolute time: {}\n",
+                    name, namespace, next_run, next_time.to_rfc2822()
+                ))
+            }
+            Err(e) => {
+                error!(error = %e, namespace = namespace, workflow = name, "Invalid cron expression");
+                Ok(format!(
+                    "Workflow '{}' in namespace '{}' has an invalid cron expression.\n",
+                    name, namespace
+                ))
+            }
+        }
+    } else {
+        warn!(namespace = namespace, workflow = name, "Workflow not found");
+        Ok(format!(
+            "Workflow '{}' not found in namespace '{}'.\n",
+            name, namespace
+        ))
+    }
+}
+
 #[instrument(skip(stream, db, scheduler), fields(client_addr = %stream.peer_addr().unwrap()))]
 async fn handle_client(
     stream: TcpStream,
@@ -807,6 +881,7 @@ async fn handle_client(
         }
         ["LIST", namespace] => list_workflows(Some(namespace), &db).await?,
         ["GET", namespace, name] => get_workflow(namespace, name, &db).await?,
+        ["NEXT", namespace, name] => get_next_run_workflow(namespace, name, &db).await?,
         ["DELETE", namespace, name] => delete_workflow(namespace, name, &db, scheduler).await?,
         ["RUN", namespace, name] => run_workflow(namespace, name, &db, scheduler).await?,
         _ => {
