@@ -18,27 +18,28 @@ Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, off
 ## Quick Start
 
 1. Clone the repository:
+
    ```bash
-   git clone https://github.com/your-username/jikan.git
-   cd jikan
+   cargo install --git https://github.com/drbh/jikan.git
+   cargo install --path /Users/drbh/Projects/jikan/jikan
+   cargo install --path /Users/drbh/Projects/jikan/jikanctl
    ```
 
-2. Install Jikan:
+2. Start the Jikan daemon:
+
    ```bash
-   cargo build --release
+   jikan
+   # or run in the background
+   jikan daemon
    ```
 
-3. Start the Jikan daemon:
-   ```bash
-   cargo run
-   ```
+3. Create a simple workflow file (e.g., `workflows/hello-world.yaml`):
 
-4. Create a simple workflow file (e.g., `workflows/hello-world.yaml`):
    ```yaml
    name: hello-world
    on:
      schedule:
-       - cron: "0 * * * * * *"  # Run every minute
+       - cron: "0 * * * * * *" # Run every minute
    jobs:
      say-hello:
        runs-on: bash
@@ -46,14 +47,21 @@ Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, off
          - run: echo "Hello, Jikan!"
    ```
 
-5. Add the workflow:
+4. Add the workflow:
+
    ```bash
-   ./jikanctl ADD hello-world
+   jikanctl REGISTER_DIR test-repo .bak/test-repo
+   jikanctl ADD_NAMESPACE test-repo .bak/test-repo
    ```
 
-6. List your workflows:
+5. List your workflows:
    ```bash
-   ./jikanctl LIST
+   jikanctl LIST test-repo
+   ```
+
+6. See the next scheduled run:
+   ```bash
+   jikanctl NEXT test-repo example-workflow
    ```
 
 ## Core Concepts
@@ -63,32 +71,17 @@ Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, off
 - **Jobs**: Individual units of work within a workflow.
 - **Triggers**: Events that initiate workflow execution (e.g., schedules, manual runs).
 
-## Installation
-
-1. Ensure you have Rust installed (https://www.rust-lang.org/tools/install).
-2. Clone the repository and build Jikan:
-   ```bash
-   git clone https://github.com/your-username/jikan.git
-   cd jikan
-   cargo build --release
-   ```
-
-3. (Optional) Set up Jikan as a system daemon:
-   ```bash
-   chmod +x daemonize.sh
-   sudo ./daemonize.sh
-   ```
-
 ## Basic Usage
 
 1. Start the Jikan daemon:
+
    ```bash
-   cargo run
+   jikanctl --help
    ```
 
 2. Use the `jikanctl` tool to interact with Jikan:
    ```bash
-   ./jikanctl COMMAND [ARGUMENTS]
+   jikanctl COMMAND [ARGUMENTS]
    ```
 
 ## Workflow Configuration
@@ -100,7 +93,7 @@ name: my-workflow
 run-name: some-run-name
 on:
   schedule:
-    - cron: "0 0 * * * * *"  # Run daily at midnight
+    - cron: "0 0 * * * * *" # Run daily at midnight
 
 jobs:
   example-job:
@@ -119,75 +112,83 @@ jobs:
 ### Workflow Management
 
 - Add a workflow:
+
   ```bash
-  ./jikanctl ADD [namespace] [name] [body]
+  jikanctl ADD [namespace] [name] [body]
   ```
 
 - List workflows:
+
   ```bash
-  ./jikanctl LIST [namespace]
+  jikanctl LIST [namespace]
   ```
 
 - Get workflow details:
+
   ```bash
-  ./jikanctl GET [namespace] [name]
+  jikanctl GET [namespace] [name]
   ```
 
 - Delete a workflow:
+
   ```bash
-  ./jikanctl DELETE [namespace] [name]
+  jikanctl DELETE [namespace] [name]
   ```
 
 - Run a workflow:
   ```bash
-  ./jikanctl RUN [namespace] [name]
+  jikanctl RUN [namespace] [name]
   ```
 
 ### Namespace Management
 
-
 - Add a namespace:
+
   ```bash
-  ./jikanctl ADD_NAMESPACE [name] [path]
+  jikanctl ADD_NAMESPACE [name] [path]
   ```
 
 - List namespaces:
+
   ```bash
-  ./jikanctl LIST_NAMESPACES
+  jikanctl LIST_NAMESPACES
   ```
 
 - Delete a namespace:
   ```bash
-  ./jikanctl DELETE_NAMESPACE [name]
+  jikanctl DELETE_NAMESPACE [name]
   ```
 
 ### Environment Variables
 
 - Set an environment variable:
+
   ```bash
-  ./jikanctl SET_ENV [namespace] [name] [key] [value]
+  jikanctl SET_ENV [namespace] [name] [key] [value]
   ```
 
 - Get an environment variable:
+
   ```bash
-  ./jikanctl GET_ENV [namespace] [name] [key]
+  jikanctl GET_ENV [namespace] [name] [key]
   ```
 
 - List environment variables:
   ```bash
-  ./jikanctl LIST_ENV [namespace] [name]
+  jikanctl LIST_ENV [namespace] [name]
   ```
 
 ## Advanced Usage
 
 - Registering directory-based workflows:
+
   ```bash
-  ./jikanctl REGISTER_DIR [namespace] [dir_path]
+  jikanctl REGISTER_DIR [namespace] [dir_path]
   ```
 
 - Checking the next scheduled run:
   ```bash
-  ./jikanctl NEXT [namespace] [name]
+  jikanctl NEXT [namespace] [name]
   ```
 
 ## Troubleshooting

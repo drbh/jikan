@@ -6,7 +6,6 @@ use cron::Schedule as CronSchedule;
 use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use rustpython_vm as vm;
-use serde::de;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -436,10 +435,12 @@ fn run_forever(scheduler: Arc<Scheduler>) {
         }
     });
 }
-
 #[tokio::main]
 #[instrument]
 async fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let run_in_background = args.get(1).map_or(false, |arg| arg == "daemon");
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -450,9 +451,9 @@ async fn main() -> std::io::Result<()> {
     info!("Starting workflow engine");
 
     // database should live in the users home directory
-    let database_dir = dirs::data_dir()
+    let database_dir = dirs::home_dir() // maybe use data_dir?
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("jikan")
+        .join(".jikan")
         .join("data");
 
     std::fs::create_dir_all(&database_dir)?;
@@ -474,7 +475,31 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    start_server_and_scheduler(db, scheduler).await
+    if run_in_background {
+        // Run in background
+        use daemonize::Daemonize;
+        let daemonize = Daemonize::new()
+            .pid_file("/tmp/jikan.pid")
+            .chown_pid_file(true)
+            .working_directory("/tmp")
+            .user("nobody")
+            .group("daemon")
+            .umask(0o777);
+
+        match daemonize.start() {
+            Ok(_) => {
+                info!("Successfully daemonized");
+                start_server_and_scheduler(db, scheduler).await
+            }
+            Err(e) => {
+                error!(error = %e, "Error daemonizing process");
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
+        }
+    } else {
+        // Run in foreground
+        start_server_and_scheduler(db, scheduler).await
+    }
 }
 
 #[instrument(skip(db, scheduler))]
