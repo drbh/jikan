@@ -31,6 +31,8 @@ Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, off
    jikan
    # or run in the background
    jikan daemon
+   # and to stop the daemon
+   jikan stop
    ```
 
 3. Create a simple workflow file (e.g., `workflows/hello-world.yaml`):

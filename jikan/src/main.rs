@@ -512,6 +512,29 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let run_in_background = args.get(1).map_or(false, |arg| arg == "daemon");
 
+    let should_stop = args.get(1).map_or(false, |arg| arg == "stop");
+
+    if should_stop {
+        let pid_file = "/tmp/jikan.pid";
+        let pid = std::fs::read_to_string(pid_file).map_err(|_e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to read PID file. Is the daemon running?",
+            )
+        })?;
+        let pid = pid.trim().parse::<i32>().map_err(|_e| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Failed to parse PID file")
+        })?;
+        unsafe {
+            // libc::kill(pid, libc::SIGTERM);
+            // gracefully stop the daemon
+            libc::kill(pid, libc::SIGINT);
+        }
+        // cleanup the pid file
+        std::fs::remove_file(pid_file)?;
+        return Ok(());
+    }
+
     let (db, scheduler) = initialize()?;
 
     if run_in_background {
@@ -809,12 +832,12 @@ async fn run_workflow(
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })?;
 
-    if let Some(workflow) = table.get((namespace, name)).map_err(|e| {
+    if let Some(_workflow) = table.get((namespace, name)).map_err(|e| {
         error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })? {
-        let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
+        //     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         // let mut job = WorkflowJob::new(config);
 
@@ -1071,7 +1094,7 @@ async fn set_env(
     name: &str,
     key: &str,
     value: &str,
-    db: &Arc<Mutex<Database>>,
+    _db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
 ) -> std::io::Result<String> {
     let jobs = scheduler.jobs.read();
@@ -1107,7 +1130,7 @@ async fn get_env(
     namespace: &str,
     name: &str,
     key: &str,
-    db: &Arc<Mutex<Database>>,
+    _db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
 ) -> std::io::Result<String> {
     let jobs = scheduler.jobs.read();
@@ -1142,7 +1165,7 @@ async fn get_env(
 async fn list_env(
     namespace: &str,
     name: &str,
-    db: &Arc<Mutex<Database>>,
+    _db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
 ) -> std::io::Result<String> {
     let jobs = scheduler.jobs.read();
