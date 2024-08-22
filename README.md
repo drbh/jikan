@@ -1,28 +1,109 @@
-# 時間 (jikan)
+# Jikan (時間): Simplified Workflow Execution
 
-> NOTE: This project is a work in progress and is not yet ready for use.
+Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, offering more features than cron while being simpler than traditional workflow engines and CI/CD pipelines.
 
-jikan is a workflow execution daemon inspired by GitHub Actions, offering more features than cron while being simpler than traditional workflow engines and CI/CD pipelines.
+## Table of Contents
 
+1. [Quick Start](#quick-start)
+2. [Core Concepts](#core-concepts)
+3. [Installation](#installation)
+4. [Basic Usage](#basic-usage)
+5. [Workflow Configuration](#workflow-configuration)
+6. [Command Reference](#command-reference)
+7. [Advanced Usage](#advanced-usage)
+8. [Troubleshooting](#troubleshooting)
+9. [Contributing](#contributing)
+10. [License](#license)
 
-## Example usage
+## Quick Start
 
-first define a simple workflow file, or use the example in `workflows/workflow-now.yaml`.
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/your-username/jikan.git
+   cd jikan
+   ```
 
-a workflow could look like this, where the `on` section defines when the workflow should run, and the `jobs` section defines the jobs that should run.
+2. Install Jikan:
+   ```bash
+   cargo build --release
+   ```
 
-- currently there are a limited set of actions that can be run, but more will be added in the future.
+3. Start the Jikan daemon:
+   ```bash
+   cargo run
+   ```
+
+4. Create a simple workflow file (e.g., `workflows/hello-world.yaml`):
+   ```yaml
+   name: hello-world
+   on:
+     schedule:
+       - cron: "0 * * * * * *"  # Run every minute
+   jobs:
+     say-hello:
+       runs-on: bash
+       steps:
+         - run: echo "Hello, Jikan!"
+   ```
+
+5. Add the workflow:
+   ```bash
+   ./jikanctl ADD hello-world
+   ```
+
+6. List your workflows:
+   ```bash
+   ./jikanctl LIST
+   ```
+
+## Core Concepts
+
+- **Workflows**: Defined tasks that Jikan executes based on triggers.
+- **Namespaces**: Logical groupings for organizing workflows.
+- **Jobs**: Individual units of work within a workflow.
+- **Triggers**: Events that initiate workflow execution (e.g., schedules, manual runs).
+
+## Installation
+
+1. Ensure you have Rust installed (https://www.rust-lang.org/tools/install).
+2. Clone the repository and build Jikan:
+   ```bash
+   git clone https://github.com/your-username/jikan.git
+   cd jikan
+   cargo build --release
+   ```
+
+3. (Optional) Set up Jikan as a system daemon:
+   ```bash
+   chmod +x daemonize.sh
+   sudo ./daemonize.sh
+   ```
+
+## Basic Usage
+
+1. Start the Jikan daemon:
+   ```bash
+   cargo run
+   ```
+
+2. Use the `jikanctl` tool to interact with Jikan:
+   ```bash
+   ./jikanctl COMMAND [ARGUMENTS]
+   ```
+
+## Workflow Configuration
+
+Create YAML files to define your workflows. Example:
 
 ```yaml
-name: workflow-now
+name: my-workflow
 run-name: some-run-name
 on:
   schedule:
-    # second minute hour day month * *
-    - cron: "0 50 18 18 8 * *"
+    - cron: "0 0 * * * * *"  # Run daily at midnight
 
 jobs:
-  some-job:
+  example-job:
     runs-on: bash
     steps:
       - run: echo "This is a test"
@@ -33,35 +114,92 @@ jobs:
       - run: func.py
 ```
 
-once a workflow is defined, we can add it to the daemon to be executed. adding, removing, and listing workflows can be done with a simple TCP call to the running daemon.
+## Command Reference
 
-it's recommended to interact using the `jikanctl` command line tool (20 line bash script) that is included in the repository.
+### Workflow Management
 
-```bash
-./jikanctl ADD workflow-now
-# Server response: Workflow 'workflow-now' added successfully.
+- Add a workflow:
+  ```bash
+  ./jikanctl ADD [namespace] [name] [body]
+  ```
 
-./jikanctl LIST
-# Server response: Workflows:
-# - workflow-now
+- List workflows:
+  ```bash
+  ./jikanctl LIST [namespace]
+  ```
 
-./jikanctl DELETE workflow-now
-# Server response: Workflow 'workflow-now' deleted successfully.
-```
+- Get workflow details:
+  ```bash
+  ./jikanctl GET [namespace] [name]
+  ```
 
-### Running jikan
+- Delete a workflow:
+  ```bash
+  ./jikanctl DELETE [namespace] [name]
+  ```
 
-```bash
-cargo run
-# 2024-08-18T18:16:35.681904Z  INFO jikan: Starting Jikan application
-# 2024-08-18T18:16:35.738946Z  INFO hydrate_scheduler: jikan: Finished hydrating scheduler hydrated_jobs=0
-# 2024-08-18T18:16:35.739127Z  INFO start_server_and_scheduler: jikan: Server listening on port 8080
-```
+- Run a workflow:
+  ```bash
+  ./jikanctl RUN [namespace] [name]
+  ```
 
-## Ideas for future features
+### Namespace Management
 
-- db and global workflows moved to global location `~/.jikan`
-- should support concept of repo/directory based workflows (like GitHub Actions)
-- inject global environment variables into all jobs and specialized keywords
-- more informative api (upcoming runs, etc)
-- add concept of logging and output capture/historical runs
+
+- Add a namespace:
+  ```bash
+  ./jikanctl ADD_NAMESPACE [name] [path]
+  ```
+
+- List namespaces:
+  ```bash
+  ./jikanctl LIST_NAMESPACES
+  ```
+
+- Delete a namespace:
+  ```bash
+  ./jikanctl DELETE_NAMESPACE [name]
+  ```
+
+### Environment Variables
+
+- Set an environment variable:
+  ```bash
+  ./jikanctl SET_ENV [namespace] [name] [key] [value]
+  ```
+
+- Get an environment variable:
+  ```bash
+  ./jikanctl GET_ENV [namespace] [name] [key]
+  ```
+
+- List environment variables:
+  ```bash
+  ./jikanctl LIST_ENV [namespace] [name]
+  ```
+
+## Advanced Usage
+
+- Registering directory-based workflows:
+  ```bash
+  ./jikanctl REGISTER_DIR [namespace] [dir_path]
+  ```
+
+- Checking the next scheduled run:
+  ```bash
+  ./jikanctl NEXT [namespace] [name]
+  ```
+
+## Troubleshooting
+
+- If Jikan fails to start, check the log file at `~/.jikan/jikan.log`.
+- Ensure all required dependencies are installed and up-to-date.
+- Verify that your workflow YAML files are correctly formatted.
+
+## Contributing
+
+We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for more information on how to get started.
+
+## License
+
+Jikan is released under the [MIT License](LICENSE).

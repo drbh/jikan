@@ -6,6 +6,7 @@ use cron::Schedule as CronSchedule;
 use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use rustpython_vm as vm;
+use serde::de;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -30,12 +31,14 @@ struct Namespace {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct JikanConfig {
+struct WorkflowYaml {
     name: String,
     #[serde(rename = "run-name")]
     run_name: String,
     on: On,
     jobs: Jobs,
+    #[serde(rename = "env")]
+    env: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -59,6 +62,10 @@ struct Job {
     #[serde(rename = "runs-on")]
     runs_on: RunOnBackend,
     steps: Vec<Step>,
+    #[serde(rename = "if")]
+    condition: Option<String>,
+    #[serde(rename = "env")]
+    env: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -83,14 +90,61 @@ trait JobTrait: Send + Sync {
     fn downcast_ref_to_workflow_job(&self) -> Option<&WorkflowJob>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Context {
+    env: HashMap<String, String>,
+}
+
+impl Context {
+    fn new() -> Self {
+        Context {
+            env: HashMap::new(),
+        }
+    }
+
+    fn set_env(&mut self, key: String, value: String) {
+        self.env.insert(key, value);
+    }
+
+    fn get_env(&self, key: &str) -> Option<&String> {
+        self.env.get(key)
+    }
+
+    fn list_env(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct WorkflowJob {
-    config: JikanConfig,
+    config: WorkflowYaml,
+    context: Arc<RwLock<Context>>,
 }
 
 impl WorkflowJob {
-    fn new(config: JikanConfig) -> Self {
-        Self { config }
+    fn new(config: WorkflowYaml) -> Self {
+        Self {
+            config,
+            context: Arc::new(RwLock::new(Context::new())),
+        }
+    }
+
+    fn set_env(&self, key: String, value: String) {
+        let mut context = self.context.write();
+        context.set_env(key, value);
+    }
+
+    fn get_env(&self, key: &str) -> Option<String> {
+        let context = self.context.read();
+        context.get_env(key).cloned()
+    }
+
+    fn list_env(&self) -> Vec<(String, String)> {
+        let context = self.context.read();
+        context.list_env()
     }
 }
 
@@ -103,8 +157,26 @@ impl JobTrait for WorkflowJob {
     fn run(&mut self) -> Result<(), String> {
         info!("Running workflow");
 
+        // underwrite the workflow environment variables
+        for (key, value) in &self.config.env {
+            self.set_env(key.clone(), value.clone());
+        }
+
         for (job_name, job) in &self.config.jobs.job_map {
             info!(job_name = %job_name, "Starting job");
+
+            // evaluate the job condition
+            if let Some(condition) = &job.condition {
+                if !self.evaluate_condition(condition) {
+                    info!(job_name = %job_name, condition = %condition, "Job condition not met, skipping");
+                    continue;
+                }
+            }
+
+            // underwrite the job environment variables
+            for (key, value) in &job.env {
+                self.set_env(key.clone(), value.clone());
+            }
 
             // TODO: improve things optional fields on steps to enable more complex workflows
             for (index, step) in job.steps.iter().enumerate() {
@@ -158,6 +230,19 @@ impl JobTrait for WorkflowJob {
 }
 
 impl WorkflowJob {
+    fn evaluate_condition(&self, condition: &str) -> bool {
+        // For simplicity, we'll just check if an environment variable is set
+        // You can expand this to handle more complex conditions
+        let parts: Vec<&str> = condition.split('=').collect();
+        if parts.len() == 2 {
+            let key = parts[0].trim();
+            let value = parts[1].trim().trim_matches('"');
+            self.get_env(key).map_or(false, |v| v == value)
+        } else {
+            false
+        }
+    }
+
     fn run_python_internal(&self, code: &str) {
         // TODO: improve embedded Python VM (maybe move behind a feature flag)
         vm::Interpreter::without_stdlib(Default::default()).enter(|vm| {
@@ -181,10 +266,13 @@ impl WorkflowJob {
 
     fn run_bash_external(&self, command: &str) {
         info!("Executing bash command: {}", command);
+        let context = self.context.read();
+
         let output = Command::new("/bin/bash")
             .arg("-c")
             .arg(command)
             .env_clear() // clear environment vars
+            .envs(&context.env)
             .current_dir("/")
             // .uid(65534) // use 'nobody' user ID for safety
             // .gid(65534) // use 'nobody' group ID for safety
@@ -211,6 +299,8 @@ impl WorkflowJob {
     fn run_python_external(&self, binary_path: &Option<String>, script: &str) {
         let binding = "python".to_string();
         let python_binary = binary_path.as_ref().unwrap_or(&binding);
+        let context = self.context.read();
+
         info!("Executing python script: {}", script);
         // TODO: improve working directory handling
         let directory = "."; // Set root as working directory
@@ -219,6 +309,7 @@ impl WorkflowJob {
             .arg(script)
             .env_clear() // clear environment vars
             .current_dir(directory)
+            .envs(&context.env)
             // .uid(65534) // use 'nobody' user ID for safety
             // .gid(65534) // use 'nobody' group ID for safety
             .stdout(std::process::Stdio::piped())
@@ -356,12 +447,23 @@ async fn main() -> std::io::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("Starting Jikan application");
+    info!("Starting workflow engine");
 
-    let db = Arc::new(Mutex::new(Database::create("jikan.redb").map_err(|e| {
-        error!(error = %e, "Failed to create database");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?));
+    // database should live in the users home directory
+    let database_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("jikan")
+        .join("data");
+
+    std::fs::create_dir_all(&database_dir)?;
+
+    let database_path = database_dir.join("jikan.redb");
+    let db = Arc::new(Mutex::new(Database::create(database_path).map_err(
+        |e| {
+            error!(error = %e, "Failed to create database");
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        },
+    )?));
 
     let scheduler: Arc<Scheduler> = Arc::new(Scheduler::new());
 
@@ -468,6 +570,35 @@ async fn start_server_and_scheduler(
     }
 }
 
+#[instrument(skip(db, scheduler))]
+async fn delete_namespace(
+    name: &str,
+    db: &Arc<Mutex<Database>>,
+    scheduler: Arc<Scheduler>,
+) -> std::io::Result<String> {
+    let db = db.lock().unwrap();
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    {
+        let mut table = write_txn
+            .open_table(NAMESPACES)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        table.remove(name).map_err(|e| {
+            error!(error = %e, namespace = name, "Failed to remove namespace");
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let mut scheduler = scheduler.jobs.write();
+    scheduler.remove(name);
+
+    Ok(format!("Namespace '{}' deleted successfully.\n", name))
+}
+
 #[instrument(skip(db))]
 async fn add_namespace(
     name: &str,
@@ -540,7 +671,7 @@ async fn add_workflow(
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
 ) -> std::io::Result<String> {
-    let config: JikanConfig = serde_yaml::from_str(yaml_content)
+    let config: WorkflowYaml = serde_yaml::from_str(yaml_content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let db = db.lock().unwrap();
@@ -590,7 +721,7 @@ async fn register_workflows_from_dir(
             let workflow_name = file_name.trim_end_matches(".yaml").trim_end_matches(".yml");
             let yaml_content = tokio::fs::read_to_string(entry.path()).await?;
 
-            if let Ok(_config) = serde_yaml::from_str::<JikanConfig>(&yaml_content) {
+            if let Ok(_config) = serde_yaml::from_str::<WorkflowYaml>(&yaml_content) {
                 add_workflow(
                     namespace,
                     workflow_name,
@@ -633,10 +764,37 @@ async fn run_workflow(
         error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })? {
-        let config: JikanConfig = serde_yaml::from_str(workflow.value())
+        let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let mut job = WorkflowJob::new(config);
+        // let mut job = WorkflowJob::new(config);
+
+        // find the job in the scheduler
+        let jobs = _scheduler.jobs.read();
+        let job = jobs
+            .get(namespace)
+            .and_then(|namespace_jobs| {
+                namespace_jobs.iter().find(|j| {
+                    j.downcast_ref_to_workflow_job()
+                        .map_or(false, |wj| wj.config.name == name)
+                })
+            })
+            .cloned();
+
+        if job.is_none() {
+            warn!(
+                namespace = namespace,
+                workflow = name,
+                "Workflow not found in scheduler"
+            );
+            return Ok(format!(
+                "Workflow '{}' not found in namespace '{}'.\n",
+                name, namespace
+            ));
+        }
+
+        let mut job = job.unwrap();
+
         match job.run() {
             Ok(_) => {
                 info!(
@@ -802,7 +960,7 @@ async fn get_next_run_workflow(
         error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })? {
-        let config: JikanConfig = serde_yaml::from_str(workflow.value())
+        let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let job = WorkflowJob::new(config);
@@ -836,7 +994,10 @@ async fn get_next_run_workflow(
                 );
                 Ok(format!(
                     "Workflow '{}' in namespace '{}' will run in {}.\nAbsolute time: {}\n",
-                    name, namespace, next_run, next_time.to_rfc2822()
+                    name,
+                    namespace,
+                    next_run,
+                    next_time.to_rfc2822()
                 ))
             }
             Err(e) => {
@@ -856,6 +1017,118 @@ async fn get_next_run_workflow(
     }
 }
 
+async fn set_env(
+    namespace: &str,
+    name: &str,
+    key: &str,
+    value: &str,
+    db: &Arc<Mutex<Database>>,
+    scheduler: Arc<Scheduler>,
+) -> std::io::Result<String> {
+    let jobs = scheduler.jobs.read();
+    if let Some(namespace_jobs) = jobs.get(namespace) {
+        if let Some(job) = namespace_jobs.iter().find(|j| {
+            j.downcast_ref_to_workflow_job()
+                .map_or(false, |wj| wj.config.name == name)
+        }) {
+            if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
+                workflow_job.set_env(key.to_string(), value.to_string());
+                Ok(format!(
+                    "Environment variable '{}' set for workflow '{}' in namespace '{}'.\n",
+                    key, name, namespace
+                ))
+            } else {
+                Ok(format!(
+                    "Workflow '{}' in namespace '{}' is not a WorkflowJob.\n",
+                    name, namespace
+                ))
+            }
+        } else {
+            Ok(format!(
+                "Workflow '{}' not found in namespace '{}'.\n",
+                name, namespace
+            ))
+        }
+    } else {
+        Ok(format!("Namespace '{}' not found.\n", namespace))
+    }
+}
+
+async fn get_env(
+    namespace: &str,
+    name: &str,
+    key: &str,
+    db: &Arc<Mutex<Database>>,
+    scheduler: Arc<Scheduler>,
+) -> std::io::Result<String> {
+    let jobs = scheduler.jobs.read();
+    if let Some(namespace_jobs) = jobs.get(namespace) {
+        if let Some(job) = namespace_jobs.iter().find(|j| {
+            j.downcast_ref_to_workflow_job()
+                .map_or(false, |wj| wj.config.name == name)
+        }) {
+            if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
+                if let Some(value) = workflow_job.get_env(key) {
+                    Ok(format!("{}={}\n", key, value))
+                } else {
+                    Ok(format!("Environment variable '{}' not found for workflow '{}' in namespace '{}'.\n", key, name, namespace))
+                }
+            } else {
+                Ok(format!(
+                    "Workflow '{}' in namespace '{}' is not a WorkflowJob.\n",
+                    name, namespace
+                ))
+            }
+        } else {
+            Ok(format!(
+                "Workflow '{}' not found in namespace '{}'.\n",
+                name, namespace
+            ))
+        }
+    } else {
+        Ok(format!("Namespace '{}' not found.\n", namespace))
+    }
+}
+
+async fn list_env(
+    namespace: &str,
+    name: &str,
+    db: &Arc<Mutex<Database>>,
+    scheduler: Arc<Scheduler>,
+) -> std::io::Result<String> {
+    let jobs = scheduler.jobs.read();
+    if let Some(namespace_jobs) = jobs.get(namespace) {
+        if let Some(job) = namespace_jobs.iter().find(|j| {
+            j.downcast_ref_to_workflow_job()
+                .map_or(false, |wj| wj.config.name == name)
+        }) {
+            if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
+                let env_vars = workflow_job.list_env();
+                let mut response = format!(
+                    "Environment variables for workflow '{}' in namespace '{}':\n",
+                    name, namespace
+                );
+                for (key, value) in env_vars {
+                    response.push_str(&format!("{}={}\n", key, value));
+                }
+                Ok(response)
+            } else {
+                Ok(format!(
+                    "Workflow '{}' in namespace '{}' is not a WorkflowJob.\n",
+                    name, namespace
+                ))
+            }
+        } else {
+            Ok(format!(
+                "Workflow '{}' not found in namespace '{}'.\n",
+                name, namespace
+            ))
+        }
+    } else {
+        Ok(format!("Namespace '{}' not found.\n", namespace))
+    }
+}
+
 #[instrument(skip(stream, db, scheduler), fields(client_addr = %stream.peer_addr().unwrap()))]
 async fn handle_client(
     stream: TcpStream,
@@ -872,6 +1145,7 @@ async fn handle_client(
 
     let response = match line.split_whitespace().collect::<Vec<&str>>().as_slice() {
         ["ADD_NAMESPACE", name, path] => add_namespace(name, path, &db).await?,
+        ["DELETE_NAMESPACE", name] => delete_namespace(name, &db, scheduler).await?,
         ["LIST_NAMESPACES"] => list_namespaces(&db).await?,
         ["REGISTER_DIR", namespace, dir_path] => {
             register_workflows_from_dir(namespace, dir_path, &db, scheduler).await?
@@ -884,6 +1158,11 @@ async fn handle_client(
         ["NEXT", namespace, name] => get_next_run_workflow(namespace, name, &db).await?,
         ["DELETE", namespace, name] => delete_workflow(namespace, name, &db, scheduler).await?,
         ["RUN", namespace, name] => run_workflow(namespace, name, &db, scheduler).await?,
+        ["SET_ENV", namespace, name, key, value] => {
+            set_env(namespace, name, key, value, &db, scheduler).await?
+        }
+        ["GET_ENV", namespace, name, key] => get_env(namespace, name, key, &db, scheduler).await?,
+        ["LIST_ENV", namespace, name] => list_env(namespace, name, &db, scheduler).await?,
         _ => {
             warn!(command = %line.trim(), "Invalid command received");
             "Invalid command. Use ADD_NAMESPACE, LIST_NAMESPACES, REGISTER_DIR, ADD, LIST, GET, or DELETE.\n".to_string()
