@@ -57,6 +57,7 @@ Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, off
    ```
 
 5. List your workflows:
+
    ```bash
    jikanctl LIST test-repo
    ```
@@ -108,6 +109,8 @@ jobs:
     steps:
       - run: func.py
 ```
+
+Learn more about syntax and how it compares to Github Actions in [SYNTAX.md](SYNTAX.md).
 
 ## Command Reference
 
