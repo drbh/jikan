@@ -3,12 +3,15 @@ use chrono::Datelike;
 use chrono::Local;
 use chrono::Timelike;
 use cron::Schedule as CronSchedule;
+use daemonize::Daemonize;
 use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use rustpython_vm as vm;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -16,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream as TokioTcpStream;
+use tokio::runtime::Runtime;
 use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use walkdir::WalkDir;
@@ -435,12 +439,8 @@ fn run_forever(scheduler: Arc<Scheduler>) {
         }
     });
 }
-#[tokio::main]
-#[instrument]
-async fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let run_in_background = args.get(1).map_or(false, |arg| arg == "daemon");
 
+fn initialize() -> std::io::Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -450,12 +450,12 @@ async fn main() -> std::io::Result<()> {
 
     info!("Starting workflow engine");
 
-    // database should live in the users home directory
-    let database_dir = dirs::home_dir() // maybe use data_dir?
+    let database_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".jikan")
         .join("data");
 
+    info!(database = %database_dir.display(), "Using database directory");
     std::fs::create_dir_all(&database_dir)?;
 
     let database_path = database_dir.join("jikan.redb");
@@ -475,31 +475,54 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    if run_in_background {
-        // Run in background
-        use daemonize::Daemonize;
-        let daemonize = Daemonize::new()
-            .pid_file("/tmp/jikan.pid")
-            .chown_pid_file(true)
-            .working_directory("/tmp")
-            .user("nobody")
-            .group("daemon")
-            .umask(0o777);
+    Ok((db, scheduler))
+}
 
-        match daemonize.start() {
-            Ok(_) => {
-                info!("Successfully daemonized");
-                start_server_and_scheduler(db, scheduler).await
-            }
-            Err(e) => {
-                error!(error = %e, "Error daemonizing process");
-                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
-            }
+fn daemonize() -> std::io::Result<()> {
+    let pid_file = "/tmp/jikan.pid";
+    let working_dir = "/tmp";
+
+    std::fs::create_dir_all(working_dir)?;
+
+    let stdout = File::create("/tmp/jikan.out")?;
+    let stderr = File::create("/tmp/jikan.err")?;
+
+    // Attempt to set permissions, but don't fail if it doesn't work
+    let _ = std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o644));
+
+    let daemonize = Daemonize::new()
+        .pid_file(pid_file)
+        .working_directory(working_dir)
+        .stdout(stdout)
+        .stderr(stderr);
+
+    match daemonize.start() {
+        Ok(_) => {
+            info!("Successfully daemonized");
+            Ok(())
         }
-    } else {
-        // Run in foreground
-        start_server_and_scheduler(db, scheduler).await
+        Err(e) => {
+            error!(error = %e, "Error daemonizing process");
+            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+        }
     }
+}
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let run_in_background = args.get(1).map_or(false, |arg| arg == "daemon");
+
+    let (db, scheduler) = initialize()?;
+
+    if run_in_background {
+        daemonize()?;
+    }
+
+    // Create and start the Tokio runtime
+    let runtime = Runtime::new()?;
+    // we defer to the tokio runtime to the bottom of the main function rather
+    // then with a macro to ensure that the daemonize function is called first
+    runtime.block_on(async { start_server_and_scheduler(db, scheduler).await })
 }
 
 #[instrument(skip(db, scheduler))]
@@ -588,6 +611,7 @@ async fn start_server_and_scheduler(
         let db = Arc::clone(&db);
         let scheduler = Arc::clone(&scheduler);
         tokio::spawn(async move {
+            info!(client_addr = %addr, "Handling client");
             if let Err(e) = handle_client(stream, db, scheduler).await {
                 error!(client_addr = %addr, error = %e, "Error handling client");
             }
