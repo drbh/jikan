@@ -123,13 +123,15 @@ impl Context {
 struct WorkflowJob {
     config: WorkflowYaml,
     context: Arc<RwLock<Context>>,
+    namespace: Namespace,
 }
 
 impl WorkflowJob {
-    fn new(config: WorkflowYaml) -> Self {
+    fn new(config: WorkflowYaml, namespace: Namespace) -> Self {
         Self {
             config,
             context: Arc::new(RwLock::new(Context::new())),
+            namespace,
         }
     }
 
@@ -157,6 +159,9 @@ impl JobTrait for WorkflowJob {
     #[instrument(skip(self), fields(workflow_name = %self.config.name))]
     fn run(&mut self) -> Result<(), String> {
         info!("Running workflow");
+
+        let working_dir = self.namespace.path.clone();
+        info!(working_dir = %working_dir.display(), "Setting working directory");
 
         match &self.config.env {
             Some(env) => {
@@ -553,7 +558,7 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: Arc<Scheduler>) -> st
         }
     };
 
-    let _namespace_table = match read_txn.open_table(NAMESPACES) {
+    let namespace_table = match read_txn.open_table(NAMESPACES) {
         Ok(table) => table,
         Err(e) => {
             if e.to_string().contains("Table not found") {
@@ -576,9 +581,27 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: Arc<Scheduler>) -> st
             std::io::Error::new(std::io::ErrorKind::Other, e)
         })?;
         let (namespace, name) = key.value();
+
+        let namespace_entry = namespace_table
+            .get(namespace)
+            .map_err(|e| {
+                error!(error = %e, namespace = namespace, "Failed to get namespace");
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })?
+            .ok_or_else(|| {
+                error!(namespace = namespace, "Namespace not found");
+                std::io::Error::new(std::io::ErrorKind::NotFound, "Namespace not found")
+            })?;
+
+        let namespace_obj: Namespace =
+            serde_json::from_str(namespace_entry.value()).map_err(|e| {
+                error!(error = %e, namespace = namespace, "Failed to parse namespace");
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
+
         match serde_yaml::from_str(yaml_content.value()) {
             Ok(config) => {
-                let workflow = WorkflowJob::new(config);
+                let workflow = WorkflowJob::new(config, namespace_obj);
                 scheduler.add(namespace, Box::new(workflow));
                 hydrated_jobs += 1;
                 info!(workflow = name, "Hydrated workflow");
@@ -745,7 +768,32 @@ async fn add_workflow(
         .commit()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    scheduler.add(namespace, Box::new(WorkflowJob::new(config)));
+    let read_txn = db.begin_read().map_err(|e| {
+        error!(error = %e, "Failed to begin read transaction");
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
+    let namespace_table = read_txn
+        .open_table(NAMESPACES)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let namespace_entry = namespace_table
+        .get(namespace)
+        .map_err(|e| {
+            error!(error = %e, namespace = namespace, "Failed to get namespace");
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?
+        .ok_or_else(|| {
+            error!(namespace = namespace, "Namespace not found");
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Namespace not found")
+        })?;
+
+    let namespace_obj: Namespace = serde_json::from_str(namespace_entry.value()).map_err(|e| {
+        error!(error = %e, namespace = namespace, "Failed to parse namespace");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
+
+    scheduler.add(namespace, Box::new(WorkflowJob::new(config, namespace_obj)));
 
     Ok(format!(
         "Workflow '{}' added successfully to namespace '{}'.\n",
@@ -1011,6 +1059,11 @@ async fn get_next_run_workflow(
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })?;
 
+    let namespace_table = read_txn.open_table(NAMESPACES).map_err(|e| {
+        error!(error = %e, "Failed to open namespaces table");
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+
     if let Some(workflow) = table.get((namespace, name)).map_err(|e| {
         error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
         std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -1018,7 +1071,24 @@ async fn get_next_run_workflow(
         let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let job = WorkflowJob::new(config);
+        let namespace_entry = namespace_table
+            .get(namespace)
+            .map_err(|e| {
+                error!(error = %e, namespace = namespace, "Failed to get namespace");
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })?
+            .ok_or_else(|| {
+                error!(namespace = namespace, "Namespace not found");
+                std::io::Error::new(std::io::ErrorKind::NotFound, "Namespace not found")
+            })?;
+
+        let namespace_obj: Namespace =
+            serde_json::from_str(namespace_entry.value()).map_err(|e| {
+                error!(error = %e, namespace = namespace, "Failed to parse namespace");
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
+
+        let job = WorkflowJob::new(config, namespace_obj);
         let cron = job.cron();
         let s = if cron == "now" {
             let now = Local::now();
