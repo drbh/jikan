@@ -6,7 +6,6 @@ use cron::Schedule as CronSchedule;
 use daemonize::Daemonize;
 use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
-use rustpython_vm as vm;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -74,7 +73,6 @@ struct Job {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 enum RunOnBackend {
-    PythonInternal,
     PythonExternal(Option<String>),
     Bash,
 }
@@ -203,9 +201,6 @@ impl JobTrait for WorkflowJob {
                     };
 
                     match &job.runs_on {
-                        RunOnBackend::PythonInternal => {
-                            self.run_python_internal(&run);
-                        }
                         RunOnBackend::Bash => {
                             self.run_bash_external(&run);
                         }
@@ -253,27 +248,6 @@ impl WorkflowJob {
         } else {
             false
         }
-    }
-
-    fn run_python_internal(&self, code: &str) {
-        // TODO: improve embedded Python VM (maybe move behind a feature flag)
-        vm::Interpreter::without_stdlib(Default::default()).enter(|vm| {
-            let scope = vm.new_scope_with_builtins();
-            match vm
-                .compile(code, vm::compiler::Mode::Exec, "<embedded>".to_owned())
-                .map_err(|err| vm.new_syntax_error(&err, Some(code)))
-            {
-                Ok(code_obj) => match vm.run_code_obj(code_obj, scope) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        error!("{:?}", err);
-                    }
-                },
-                Err(err) => {
-                    error!("{:?}", err);
-                }
-            }
-        });
     }
 
     fn run_bash_external(&self, command: &str) {
