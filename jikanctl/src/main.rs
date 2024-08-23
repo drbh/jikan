@@ -2,6 +2,8 @@ use clap::{Arg, Command};
 use std::process::Command as ProcessCommand;
 
 fn main() -> std::io::Result<()> {
+    let location_when_cli_is_run = std::env::current_dir()?;
+
     let matches = Command::new("jikanctl")
         .version("1.0")
         .author("Your Name")
@@ -127,6 +129,17 @@ fn main() -> std::io::Result<()> {
         Some(("ADD_NAMESPACE", sub_m)) => {
             let name = sub_m.get_one::<String>("name").unwrap();
             let path = sub_m.get_one::<String>("path").unwrap();
+
+            let path = if path.starts_with("/") {
+                path.clone()
+            } else {
+                location_when_cli_is_run
+                    .join(&path)
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            };
+
             format!("ADD_NAMESPACE {} {}", name, path)
         }
         Some(("LIST_NAMESPACES", _)) => "LIST_NAMESPACES".to_string(),
@@ -164,6 +177,17 @@ fn main() -> std::io::Result<()> {
         Some(("REGISTER_DIR", sub_m)) => {
             let namespace = sub_m.get_one::<String>("namespace").unwrap();
             let dir_path = sub_m.get_one::<String>("dir_path").unwrap();
+
+            let dir_path = if dir_path.starts_with("/") {
+                dir_path.clone()
+            } else {
+                location_when_cli_is_run
+                    .join(&dir_path)
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            };
+
             format!("REGISTER_DIR {} {}", namespace, dir_path)
         }
         Some(("NEXT", sub_m)) => {

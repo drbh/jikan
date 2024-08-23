@@ -683,6 +683,10 @@ async fn add_namespace(
     path: &str,
     db: &Arc<Mutex<Database>>,
 ) -> std::io::Result<String> {
+    if path.starts_with('.') {
+        return Ok("Invalid directory path. Please provide an absolute path.".to_string());
+    }
+
     let namespace = Namespace {
         name: name.to_string(),
         path: PathBuf::from(path),
@@ -809,6 +813,35 @@ async fn register_workflows_from_dir(
     scheduler: Arc<Scheduler>,
 ) -> std::io::Result<String> {
     let mut registered = 0;
+
+    println!("Registering workflows from directory: {}", dir_path);
+
+    if dir_path.starts_with('.') {
+        return Ok("Invalid directory path. Please provide an absolute path.".to_string());
+    }
+
+    // TODO: revisit relationship with namespace when registering workflows
+    // {
+    //     // make sure to add the namespace if it doesn't exist
+    //     let db = db.lock().unwrap();
+    //     let write_txn = db
+    //         .begin_write()
+    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    //     {
+    //         let mut table = write_txn
+    //             .open_table(NAMESPACES)
+    //             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    //         table
+    //             .insert(namespace, dir_path)
+    //             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    //     }
+
+    //     // end the write transaction
+    //     write_txn
+    //         .commit()
+    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    // }
+
     for entry in WalkDir::new(dir_path)
         .follow_links(true)
         .into_iter()
