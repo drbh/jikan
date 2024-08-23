@@ -28,20 +28,20 @@ const WORKFLOWS: TableDefinition<(&str, &str), &str> = TableDefinition::new("wor
 const NAMESPACES: TableDefinition<&str, &str> = TableDefinition::new("namespaces");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Namespace {
+pub struct Namespace {
     name: String,
     path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct WorkflowYaml {
+pub struct WorkflowYaml {
     name: String,
     #[serde(rename = "run-name")]
-    run_name: String,
+    run_name: Option<String>,
     on: On,
     jobs: Jobs,
     #[serde(rename = "env")]
-    env: HashMap<String, String>,
+    env: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -68,7 +68,7 @@ struct Job {
     #[serde(rename = "if")]
     condition: Option<String>,
     #[serde(rename = "env")]
-    env: HashMap<String, String>,
+    env: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -160,9 +160,14 @@ impl JobTrait for WorkflowJob {
     fn run(&mut self) -> Result<(), String> {
         info!("Running workflow");
 
-        // underwrite the workflow environment variables
-        for (key, value) in &self.config.env {
-            self.set_env(key.clone(), value.clone());
+        match &self.config.env {
+            Some(env) => {
+                for (key, value) in env {
+                    info!(key = %key, value = %value, "Setting environment variable");
+                    self.set_env(key.clone(), value.clone());
+                }
+            }
+            None => {}
         }
 
         for (job_name, job) in &self.config.jobs.job_map {
@@ -176,9 +181,13 @@ impl JobTrait for WorkflowJob {
                 }
             }
 
-            // underwrite the job environment variables
-            for (key, value) in &job.env {
-                self.set_env(key.clone(), value.clone());
+            match &job.env {
+                Some(env) => {
+                    for (key, value) in env {
+                        self.set_env(key.clone(), value.clone());
+                    }
+                }
+                None => {}
             }
 
             // TODO: improve things optional fields on steps to enable more complex workflows
