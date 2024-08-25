@@ -10,49 +10,49 @@ fn main() -> std::io::Result<()> {
         .author("Your Name")
         .about("Control interface for Jikan workflow execution daemon")
         .subcommand(
-            Command::new("ADD")
+            Command::new("add")
                 .about("Add a workflow")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true))
                 .arg(Arg::new("body").required(true)),
         )
         .subcommand(
-            Command::new("LIST")
+            Command::new("list")
                 .about("List workflows")
                 .arg(Arg::new("namespace").required(false)),
         )
         .subcommand(
-            Command::new("GET")
+            Command::new("get")
                 .about("Get workflow details")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(
-            Command::new("DELETE")
+            Command::new("delete")
                 .about("Delete a workflow")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(
-            Command::new("RUN")
+            Command::new("run")
                 .about("Run a workflow")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(
-            Command::new("ADD_NAMESPACE")
+            Command::new("add_namespace")
                 .about("Add a namespace")
                 .arg(Arg::new("name").required(true))
                 .arg(Arg::new("path").required(true)),
         )
         .subcommand(Command::new("LIST_NAMESPACES").about("List namespaces"))
         .subcommand(
-            Command::new("DELETE_NAMESPACE")
+            Command::new("delete_namespace")
                 .about("Delete a namespace")
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(
-            Command::new("SET_ENV")
+            Command::new("set_env")
                 .about("Set an environment variable")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true))
@@ -60,26 +60,26 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("value").required(true)),
         )
         .subcommand(
-            Command::new("GET_ENV")
+            Command::new("get_env")
                 .about("Get an environment variable")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true))
                 .arg(Arg::new("key").required(true)),
         )
         .subcommand(
-            Command::new("LIST_ENV")
+            Command::new("list_env")
                 .about("List environment variables")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(
-            Command::new("REGISTER_DIR")
+            Command::new("register_dir")
                 .about("Register directory-based workflows")
                 .arg(Arg::new("namespace").required(true))
                 .arg(Arg::new("dir_path").required(true)),
         )
         .subcommand(
-            Command::new("NEXT")
+            Command::new("next")
                 .about("Check the next scheduled run")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true)),
@@ -88,7 +88,7 @@ fn main() -> std::io::Result<()> {
         .get_matches();
 
     let command = match matches.subcommand() {
-        Some(("ADD", sub_m)) => {
+        Some(("add", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
@@ -96,34 +96,34 @@ fn main() -> std::io::Result<()> {
             let body = sub_m.get_one::<String>("body").unwrap();
             format!("ADD {namespace} {name} {body}")
         }
-        Some(("LIST", sub_m)) => {
+        Some(("list", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
             format!("LIST {namespace}")
         }
-        Some(("GET", sub_m)) => {
+        Some(("get", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("GET {namespace} {name}")
         }
-        Some(("DELETE", sub_m)) => {
+        Some(("delete", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("DELETE {namespace} {name}")
         }
-        Some(("RUN", sub_m)) => {
+        Some(("run", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("RUN {namespace} {name}")
         }
-        Some(("ADD_NAMESPACE", sub_m)) => {
+        Some(("add_namespace", sub_m)) => {
             let name = sub_m.get_one::<String>("name").unwrap();
             let path = sub_m.get_one::<String>("path").unwrap();
 
@@ -139,12 +139,12 @@ fn main() -> std::io::Result<()> {
 
             format!("ADD_NAMESPACE {name} {path}")
         }
-        Some(("LIST_NAMESPACES", _)) => "LIST_NAMESPACES".to_string(),
+        Some(("list_namespaces", _)) => "LIST_NAMESPACES".to_string(),
         Some(("DELETE_NAMESPACE", sub_m)) => {
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("DELETE_NAMESPACE {name}")
         }
-        Some(("SET_ENV", sub_m)) => {
+        Some(("set_env", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
@@ -153,7 +153,7 @@ fn main() -> std::io::Result<()> {
             let value = sub_m.get_one::<String>("value").unwrap();
             format!("SET_ENV {namespace} {name} {key} {value}")
         }
-        Some(("GET_ENV", sub_m)) => {
+        Some(("get_env", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
@@ -161,14 +161,14 @@ fn main() -> std::io::Result<()> {
             let key = sub_m.get_one::<String>("key").unwrap();
             format!("GET_ENV {namespace} {name} {key}")
         }
-        Some(("LIST_ENV", sub_m)) => {
+        Some(("list_env", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("LIST_ENV {namespace} {name}")
         }
-        Some(("REGISTER_DIR", sub_m)) => {
+        Some(("register_dir", sub_m)) => {
             let namespace = sub_m.get_one::<String>("namespace").unwrap();
             let dir_path = sub_m.get_one::<String>("dir_path").unwrap();
 
@@ -184,7 +184,7 @@ fn main() -> std::io::Result<()> {
 
             format!("REGISTER_DIR {namespace} {dir_path}")
         }
-        Some(("NEXT", sub_m)) => {
+        Some(("next", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
