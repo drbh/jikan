@@ -207,10 +207,10 @@ impl JobTrait for WorkflowJob {
 
                     match &job.runs_on {
                         RunOnBackend::Bash => {
-                            self.run_bash_external(&run);
+                            self.run_bash_external(&run, working_dir.clone());
                         }
                         RunOnBackend::PythonExternal(binary_path) => {
-                            self.run_python_external(binary_path, &run);
+                            self.run_python_external(binary_path, &run, working_dir.clone());
                         }
                     }
                 }
@@ -255,16 +255,16 @@ impl WorkflowJob {
         }
     }
 
-    fn run_bash_external(&self, command: &str) {
+    fn run_bash_external(&self, command: &str, working_dir: PathBuf) {
         info!("Executing bash command: {}", command);
         let context = self.context.read();
 
         let output = Command::new("/bin/bash")
             .arg("-c")
             .arg(command)
+            .current_dir(working_dir)
             .env_clear() // clear environment vars
             .envs(&context.env)
-            .current_dir("/")
             // .uid(65534) // use 'nobody' user ID for safety
             // .gid(65534) // use 'nobody' group ID for safety
             .stdout(std::process::Stdio::piped())
@@ -287,7 +287,12 @@ impl WorkflowJob {
         }
     }
 
-    fn run_python_external(&self, binary_path: &Option<String>, script: &str) {
+    fn run_python_external(
+        &self,
+        binary_path: &Option<String>,
+        script: &str,
+        working_dir: PathBuf,
+    ) {
         let binding = "python".to_string();
         let python_binary = binary_path.as_ref().unwrap_or(&binding);
         let context = self.context.read();
@@ -298,6 +303,7 @@ impl WorkflowJob {
         let output = std::process::Command::new(python_binary)
             .arg("-c")
             .arg(script)
+            .current_dir(working_dir)
             .env_clear() // clear environment vars
             .current_dir(directory)
             .envs(&context.env)
@@ -346,10 +352,25 @@ impl Scheduler {
 
     fn add(&self, namespace: &str, job: Box<dyn JobTrait>) {
         let mut jobs = self.jobs.write();
-        jobs.entry(namespace.to_string())
-            .or_default()
-            .push(job.clone());
-        info!(namespace = %namespace, job = %job.downcast_ref_to_workflow_job().unwrap().config.name, "Adding job");
+        let namespace_jobs = jobs.entry(namespace.to_string()).or_default();
+        let job_name = job
+            .clone()
+            .downcast_ref_to_workflow_job()
+            .unwrap()
+            .config
+            .name
+            .clone();
+        let job_index = namespace_jobs
+            .iter()
+            .position(|j| j.downcast_ref_to_workflow_job().unwrap().config.name == job_name);
+
+        if let Some(index) = job_index {
+            namespace_jobs[index] = job.clone();
+        } else {
+            namespace_jobs.push(job.clone());
+        }
+
+        info!(namespace = %namespace, job = %job.downcast_ref_to_workflow_job().unwrap().config.name, "🌈 Adding job");
     }
 
     fn remove(&self, namespace: &str, name: &str) {
@@ -630,9 +651,31 @@ async fn start_server_and_scheduler(
         run_forever(scheduler_clone);
     });
 
-    // start TCP server
-    let listener = TcpListener::bind("127.0.0.1:8080")?;
-    info!("Server listening on port 8080");
+    let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = format!("{}:{}", host, port);
+    let listener = TcpListener::bind(addr.clone())?;
+    info!(address = %addr, "Server started");
+
+    {
+        // ensure the NAMEPACES table and WORKFLOWS table exist (write dummy data; key, value)
+        let db = db.lock().unwrap();
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            write_txn
+                .open_table(NAMESPACES)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            write_txn
+                .open_table(WORKFLOWS)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    }
 
     loop {
         let (stream, addr) = listener.accept()?;
@@ -814,35 +857,45 @@ async fn register_workflows_from_dir(
 ) -> std::io::Result<String> {
     let mut registered = 0;
 
-    println!("Registering workflows from directory: {}", dir_path);
+    let namespace_path = PathBuf::from(dir_path);
+    let workspace_path = namespace_path.join(".jikan").join("workflows");
 
-    if dir_path.starts_with('.') {
+    println!(
+        "Registering workflows from directory: {}",
+        workspace_path.display()
+    );
+
+    if workspace_path.is_relative() {
         return Ok("Invalid directory path. Please provide an absolute path.".to_string());
     }
 
-    // TODO: revisit relationship with namespace when registering workflows
-    // {
-    //     // make sure to add the namespace if it doesn't exist
-    //     let db = db.lock().unwrap();
-    //     let write_txn = db
-    //         .begin_write()
-    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    //     {
-    //         let mut table = write_txn
-    //             .open_table(NAMESPACES)
-    //             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    //         table
-    //             .insert(namespace, dir_path)
-    //             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    //     }
+    {
+        // write the namespace to the database
+        let db = db.lock().unwrap();
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        {
+            let mut table = write_txn
+                .open_table(NAMESPACES)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let new_namespace = Namespace {
+                name: namespace.to_string(),
+                path: namespace_path.clone(),
+            };
+            table
+                .insert(
+                    namespace,
+                    serde_json::to_string(&new_namespace).unwrap().as_str(),
+                )
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    }
 
-    //     // end the write transaction
-    //     write_txn
-    //         .commit()
-    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    // }
-
-    for entry in WalkDir::new(dir_path)
+    for entry in WalkDir::new(workspace_path.clone())
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -900,11 +953,6 @@ async fn run_workflow(
         error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })? {
-        // let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
-        //     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // let mut job = WorkflowJob::new(config);
-
         // find the job in the scheduler
         let jobs = _scheduler.jobs.read();
         let job = jobs

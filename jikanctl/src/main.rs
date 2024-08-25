@@ -83,6 +83,7 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true)),
         )
+        .subcommand(Command::new("init").about("Initialize a new Jikan project"))
         .get_matches();
 
     let command = match matches.subcommand() {
@@ -134,7 +135,7 @@ fn main() -> std::io::Result<()> {
                 path.clone()
             } else {
                 location_when_cli_is_run
-                    .join(&path)
+                    .join(path)
                     .to_str()
                     .unwrap()
                     .to_string()
@@ -182,7 +183,7 @@ fn main() -> std::io::Result<()> {
                 dir_path.clone()
             } else {
                 location_when_cli_is_run
-                    .join(&dir_path)
+                    .join(dir_path)
                     .to_str()
                     .unwrap()
                     .to_string()
@@ -197,6 +198,18 @@ fn main() -> std::io::Result<()> {
                 .unwrap_or("default");
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("NEXT {} {}", namespace, name)
+        }
+        Some(("init", _sub_m)) => {
+            let namespace = location_when_cli_is_run
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            format!(
+                "REGISTER_DIR {} {}",
+                namespace,
+                location_when_cli_is_run.to_str().unwrap()
+            )
         }
         _ => {
             println!("Invalid command. Use --help for usage information.");

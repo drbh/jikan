@@ -1,0 +1,12 @@
+name: daily-brief
+on:
+  schedule:
+    - cron: "0 7 * * * * *"  # Morning routine at 7:00 AM
+jobs:
+  morning-routine:
+    runs-on: bash
+    steps:
+      - run: echo "Good morning! Here's your daily brief:" > ./daily_brief.md
+      - run: date "+%A, %B %d, %Y" >> ./daily_brief.md
+      - run: echo "## Today's Weather" >> ./daily_brief.md
+      - run: curl wttr.in/jfk\?0\?q\?T | sed 's/\x1b\[[0-9;]*m//g' >> ./daily_brief.md
