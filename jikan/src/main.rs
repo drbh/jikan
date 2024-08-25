@@ -1,24 +1,26 @@
-use chrono::DateTime;
-use chrono::Datelike;
-use chrono::Local;
-use chrono::Timelike;
+use anyhow::{Context as _, Result};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use cron::Schedule as CronSchedule;
 use daemonize::Daemonize;
 use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
-use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::Command;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::TcpStream as TokioTcpStream;
+use std::{
+    fs::File,
+    net::{TcpListener, TcpStream},
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    process::Command,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::runtime::Runtime;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt},
+    net::TcpStream as TokioTcpStream,
+};
 use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use walkdir::WalkDir;
@@ -370,7 +372,7 @@ impl Scheduler {
             namespace_jobs.push(job.clone());
         }
 
-        info!(namespace = %namespace, job = %job.downcast_ref_to_workflow_job().unwrap().config.name, "🌈 Adding job");
+        info!(namespace = %namespace, job = %job.downcast_ref_to_workflow_job().unwrap().config.name, "Adding job");
     }
 
     fn remove(&self, namespace: &str, name: &str) {
@@ -384,7 +386,7 @@ impl Scheduler {
                 }
             });
         }
-        info!(namespace = %namespace, remaining_jobs = jobs.get(namespace).map_or(0, |j| j.len()), "Remaining jobs");
+        info!(namespace = %namespace, remaining_jobs = jobs.get(namespace).map_or(0, std::vec::Vec::len), "Remaining jobs");
     }
 
     fn run(&self) {
@@ -393,14 +395,13 @@ impl Scheduler {
             debug!(namespace = %namespace, starting_jobs = namespace_jobs.len(), "Starting to check jobs");
             namespace_jobs.retain_mut(|job| {
             if let Some(workflow_job) = job.clone().downcast_ref_to_workflow_job() {
-                let _s = workflow_job.cron();
-
-                let s = if _s == "now" {
+                let s = workflow_job.cron();
+                let s = if s == "now" {
                     let now = Local::now();
                     let in_near_future = now + chrono::Duration::seconds(1);
                     time_to_cron(in_near_future)
                 } else {
-                    _s.to_string()
+                    s.to_string()
                 };
 
                 match CronSchedule::from_str(&s) {
@@ -414,7 +415,7 @@ impl Scheduler {
                         });
                         if should_run {
                             match job.run() {
-                                Ok(_) => {
+                                Ok(()) => {
                                     info!(job = %workflow_job.config.name, "Job ran successfully");
                                 }
                                 Err(e) => {
@@ -478,9 +479,9 @@ fn initialize() -> std::io::Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
     let scheduler: Arc<Scheduler> = Arc::new(Scheduler::new());
 
     match hydrate_scheduler(&db, scheduler.clone()) {
-        Ok(_) => {}
+        Ok(()) => {}
         Err(e) => {
-            warn!(error = %e, "Failed to hydrate scheduler")
+            warn!(error = %e, "Failed to hydrate scheduler");
         }
     }
 
@@ -506,7 +507,7 @@ fn daemonize() -> std::io::Result<()> {
         .stderr(stderr);
 
     match daemonize.start() {
-        Ok(_) => {
+        Ok(()) => {
             info!("Successfully daemonized");
             Ok(())
         }
@@ -558,67 +559,47 @@ fn main() -> std::io::Result<()> {
 }
 
 #[instrument(skip(db, scheduler))]
-fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: Arc<Scheduler>) -> std::io::Result<()> {
-    let db_guard = db.lock().unwrap();
-    let read_txn = db_guard.begin_read().map_err(|e| {
-        error!(error = %e, "Failed to begin read transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: Arc<Scheduler>) -> Result<()> {
+    let db_guard = db
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Failed to lock database: {}", e))?;
+    let read_txn = db_guard
+        .begin_read()
+        .context("Failed to begin read transaction")?;
 
-    // attempt to open the table, but don't fail if it doesn't exist
     let table = match read_txn.open_table(WORKFLOWS) {
         Ok(table) => table,
-        Err(e) => {
-            if e.to_string().contains("Table not found") {
-                warn!("Workflows table not found. Starting with an empty scheduler.");
-                info!("Finished hydrating scheduler (0 workflows)");
-                return Ok(());
-            } else {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-            }
+        Err(e) if e.to_string().contains("Table not found") => {
+            warn!("Workflows table not found. Starting with an empty scheduler.");
+            info!("Finished hydrating scheduler (0 workflows)");
+            return Ok(());
         }
+        Err(e) => return Err(e).context("Failed to open workflows table"),
     };
 
     let namespace_table = match read_txn.open_table(NAMESPACES) {
         Ok(table) => table,
-        Err(e) => {
-            if e.to_string().contains("Table not found") {
-                warn!("Namespaces table not found. Starting with an empty scheduler.");
-                info!("Finished hydrating scheduler (0 workflows)");
-                return Ok(());
-            } else {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-            }
+        Err(e) if e.to_string().contains("Table not found") => {
+            warn!("Namespaces table not found. Starting with an empty scheduler.");
+            info!("Finished hydrating scheduler (0 workflows)");
+            return Ok(());
         }
+        Err(e) => return Err(e).context("Failed to open namespaces table"),
     };
 
     let mut hydrated_jobs = 0;
-    for result in table.iter().map_err(|e| {
-        error!(error = %e, "Failed to iterate over workflows");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })? {
-        let (key, yaml_content) = result.map_err(|e| {
-            error!(error = %e, "Failed to read workflow entry");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+
+    for result in table.iter().context("Failed to iterate over workflows")? {
+        let (key, yaml_content) = result.context("Failed to read workflow entry")?;
         let (namespace, name) = key.value();
 
         let namespace_entry = namespace_table
             .get(namespace)
-            .map_err(|e| {
-                error!(error = %e, namespace = namespace, "Failed to get namespace");
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            })?
-            .ok_or_else(|| {
-                error!(namespace = namespace, "Namespace not found");
-                std::io::Error::new(std::io::ErrorKind::NotFound, "Namespace not found")
-            })?;
+            .with_context(|| format!("Failed to get namespace: {namespace}"))?
+            .ok_or_else(|| anyhow::anyhow!("Namespace not found: {namespace}"))?;
 
-        let namespace_obj: Namespace =
-            serde_json::from_str(namespace_entry.value()).map_err(|e| {
-                error!(error = %e, namespace = namespace, "Failed to parse namespace");
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            })?;
+        let namespace_obj: Namespace = serde_json::from_str(namespace_entry.value())
+            .with_context(|| format!("Failed to parse namespace: {namespace}"))?;
 
         match serde_yaml::from_str(yaml_content.value()) {
             Ok(config) => {
@@ -653,7 +634,7 @@ async fn start_server_and_scheduler(
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = format!("{}:{}", host, port);
+    let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(addr.clone())?;
     info!(address = %addr, "Server started");
 
@@ -717,7 +698,7 @@ async fn delete_namespace(
     let mut scheduler = scheduler.jobs.write();
     scheduler.remove(name);
 
-    Ok(format!("Namespace '{}' deleted successfully.\n", name))
+    Ok(format!("Namespace '{name}' deleted successfully.\n"))
 }
 
 #[instrument(skip(db))]
@@ -751,7 +732,7 @@ async fn add_namespace(
         .commit()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    Ok(format!("Namespace '{}' added successfully.\n", name))
+    Ok(format!("Namespace '{name}' added successfully.\n"))
 }
 
 #[instrument(skip(db))]
@@ -843,8 +824,7 @@ async fn add_workflow(
     scheduler.add(namespace, Box::new(WorkflowJob::new(config, namespace_obj)));
 
     Ok(format!(
-        "Workflow '{}' added successfully to namespace '{}'.\n",
-        name, namespace
+        "Workflow '{name}' added successfully to namespace '{namespace}'.\n",
     ))
 }
 
@@ -898,7 +878,7 @@ async fn register_workflows_from_dir(
     for entry in WalkDir::new(workspace_path.clone())
         .follow_links(true)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
     {
         if entry.file_type().is_file()
             && entry
@@ -927,17 +907,16 @@ async fn register_workflows_from_dir(
     }
 
     Ok(format!(
-        "Registered {} workflows in namespace '{}'.\n",
-        registered, namespace
+        "Registered {registered} workflows in namespace '{namespace}'.\n",
     ))
 }
 
-#[instrument(skip(db, _scheduler))]
+#[instrument(skip(db, scheduler))]
 async fn run_workflow(
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
-    _scheduler: Arc<Scheduler>,
+    scheduler: Arc<Scheduler>,
 ) -> std::io::Result<String> {
     let db = db.lock().unwrap();
     let read_txn = db.begin_read().map_err(|e| {
@@ -954,7 +933,7 @@ async fn run_workflow(
         std::io::Error::new(std::io::ErrorKind::Other, e)
     })? {
         // find the job in the scheduler
-        let jobs = _scheduler.jobs.read();
+        let jobs = scheduler.jobs.read();
         let job = jobs
             .get(namespace)
             .and_then(|namespace_jobs| {
@@ -972,38 +951,34 @@ async fn run_workflow(
                 "Workflow not found in scheduler"
             );
             return Ok(format!(
-                "Workflow '{}' not found in namespace '{}'.\n",
-                name, namespace
+                "Workflow '{name}' not found in namespace '{namespace}'.\n",
             ));
         }
 
         let mut job = job.unwrap();
 
         match job.run() {
-            Ok(_) => {
+            Ok(()) => {
                 info!(
                     namespace = namespace,
                     workflow = name,
                     "Workflow ran successfully"
                 );
                 Ok(format!(
-                    "Workflow '{}' in namespace '{}' ran successfully.\n",
-                    name, namespace
+                    "Workflow '{name}' in namespace '{namespace}' ran successfully.\n",
                 ))
             }
             Err(e) => {
                 error!(namespace = namespace, workflow = name, error = %e, "Workflow failed to run");
                 Ok(format!(
-                    "Workflow '{}' in namespace '{}' failed to run: {}\n",
-                    name, namespace, e
+                    "Workflow '{name}' in namespace '{namespace}' failed to run: {e}\n"
                 ))
             }
         }
     } else {
         warn!(namespace = namespace, workflow = name, "Workflow not found");
         Ok(format!(
-            "Workflow '{}' not found in namespace '{}'.\n",
-            name, namespace
+            "Workflow '{name}' not found in namespace '{namespace}'.\n",
         ))
     }
 }
@@ -1036,7 +1011,7 @@ async fn list_workflows(
         let (ns, name) = key.value();
 
         if namespace.is_none() || namespace == Some(ns) {
-            response.push_str(&format!("- {} (namespace: {})\n", name, ns));
+            response.push_str(&format!("- {name} (namespace: {ns})\n"));
         }
     }
 
@@ -1070,16 +1045,13 @@ async fn get_workflow(
             "Workflow retrieved successfully"
         );
         Ok(format!(
-            "Workflow '{}' in namespace '{}':\n{}",
-            name,
-            namespace,
+            "Workflow '{name}' in namespace '{namespace}':\n{}",
             workflow.value()
         ))
     } else {
         warn!(namespace = namespace, workflow = name, "Workflow not found");
         Ok(format!(
-            "Workflow '{}' not found in namespace '{}'.\n",
-            name, namespace
+            "Workflow '{name}' not found in namespace '{namespace}'.\n"
         ))
     }
 }
@@ -1119,8 +1091,7 @@ async fn delete_workflow(
         "Workflow deleted successfully"
     );
     Ok(format!(
-        "Workflow '{}' deleted successfully from namespace '{}'.\n",
-        name, namespace
+        "Workflow '{name}' deleted successfully from namespace '{namespace}'.\n"
     ))
 }
 
@@ -1189,7 +1160,7 @@ async fn get_next_run_workflow(
                         .map_or((now, "never".to_string()), |t| {
                             let time_diff = t - now;
                             let num_seconds = time_diff.num_seconds();
-                            (t, format!("{} seconds", num_seconds))
+                            (t, format!("{num_seconds} seconds"))
                         });
 
                 info!(
@@ -1199,38 +1170,33 @@ async fn get_next_run_workflow(
                     "Next run calculated"
                 );
                 Ok(format!(
-                    "Workflow '{}' in namespace '{}' will run in {}.\nAbsolute time: {}\n",
-                    name,
-                    namespace,
-                    next_run,
+                    "Workflow '{name}' in namespace '{namespace}' will run in {next_run}.\nAbsolute time: {}\n",
                     next_time.to_rfc2822()
                 ))
             }
             Err(e) => {
                 error!(error = %e, namespace = namespace, workflow = name, "Invalid cron expression");
                 Ok(format!(
-                    "Workflow '{}' in namespace '{}' has an invalid cron expression.\n",
-                    name, namespace
+                    "Workflow '{name}' in namespace '{namespace}' has an invalid cron expression.\n"
                 ))
             }
         }
     } else {
         warn!(namespace = namespace, workflow = name, "Workflow not found");
         Ok(format!(
-            "Workflow '{}' not found in namespace '{}'.\n",
-            name, namespace
+            "Workflow '{name}' not found in namespace '{namespace}'.\n",
         ))
     }
 }
 
-async fn set_env(
+fn set_env(
     namespace: &str,
     name: &str,
     key: &str,
     value: &str,
     _db: &Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
+    scheduler: &Arc<Scheduler>,
+) -> String {
     let jobs = scheduler.jobs.read();
     if let Some(namespace_jobs) = jobs.get(namespace) {
         if let Some(job) = namespace_jobs.iter().find(|j| {
@@ -1239,34 +1205,27 @@ async fn set_env(
         }) {
             if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
                 workflow_job.set_env(key.to_string(), value.to_string());
-                Ok(format!(
-                    "Environment variable '{}' set for workflow '{}' in namespace '{}'.\n",
-                    key, name, namespace
-                ))
+                format!(
+                    "Environment variable '{key}' set for workflow '{name}' in namespace '{namespace}'.\n",
+                )
             } else {
-                Ok(format!(
-                    "Workflow '{}' in namespace '{}' is not a WorkflowJob.\n",
-                    name, namespace
-                ))
+                format!("Workflow '{name}' in namespace '{namespace}' is not a WorkflowJob.\n",)
             }
         } else {
-            Ok(format!(
-                "Workflow '{}' not found in namespace '{}'.\n",
-                name, namespace
-            ))
+            format!("Workflow '{name}' not found in namespace '{namespace}'.\n",)
         }
     } else {
-        Ok(format!("Namespace '{}' not found.\n", namespace))
+        format!("Namespace '{namespace}' not found.\n",)
     }
 }
 
-async fn get_env(
+fn get_env(
     namespace: &str,
     name: &str,
     key: &str,
     _db: &Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
+    scheduler: &Arc<Scheduler>,
+) -> String {
     let jobs = scheduler.jobs.read();
     if let Some(namespace_jobs) = jobs.get(namespace) {
         if let Some(job) = namespace_jobs.iter().find(|j| {
@@ -1275,33 +1234,27 @@ async fn get_env(
         }) {
             if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
                 if let Some(value) = workflow_job.get_env(key) {
-                    Ok(format!("{}={}\n", key, value))
+                    format!("{key}={value}\n")
                 } else {
-                    Ok(format!("Environment variable '{}' not found for workflow '{}' in namespace '{}'.\n", key, name, namespace))
+                    format!("Environment variable '{key}' not found for workflow '{name}' in namespace '{namespace}'.\n")
                 }
             } else {
-                Ok(format!(
-                    "Workflow '{}' in namespace '{}' is not a WorkflowJob.\n",
-                    name, namespace
-                ))
+                format!("Workflow '{name}' in namespace '{namespace}' is not a WorkflowJob.\n")
             }
         } else {
-            Ok(format!(
-                "Workflow '{}' not found in namespace '{}'.\n",
-                name, namespace
-            ))
+            format!("Workflow '{name}' not found in namespace '{namespace}'.\n")
         }
     } else {
-        Ok(format!("Namespace '{}' not found.\n", namespace))
+        format!("Namespace '{namespace}' not found.\n")
     }
 }
 
-async fn list_env(
+fn list_env(
     namespace: &str,
     name: &str,
     _db: &Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
+    scheduler: &Arc<Scheduler>,
+) -> String {
     let jobs = scheduler.jobs.read();
     if let Some(namespace_jobs) = jobs.get(namespace) {
         if let Some(job) = namespace_jobs.iter().find(|j| {
@@ -1311,27 +1264,20 @@ async fn list_env(
             if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
                 let env_vars = workflow_job.list_env();
                 let mut response = format!(
-                    "Environment variables for workflow '{}' in namespace '{}':\n",
-                    name, namespace
+                    "Environment variables for workflow '{name}' in namespace '{namespace}':\n"
                 );
                 for (key, value) in env_vars {
-                    response.push_str(&format!("{}={}\n", key, value));
+                    response.push_str(&format!("{key}={value}\n"));
                 }
-                Ok(response)
+                response
             } else {
-                Ok(format!(
-                    "Workflow '{}' in namespace '{}' is not a WorkflowJob.\n",
-                    name, namespace
-                ))
+                format!("Workflow '{name}' in namespace '{namespace}' is not a W©orkflowJob.\n")
             }
         } else {
-            Ok(format!(
-                "Workflow '{}' not found in namespace '{}'.\n",
-                name, namespace
-            ))
+            format!("Workflow '{name}' not found in namespace '{namespace}'.\n")
         }
     } else {
-        Ok(format!("Namespace '{}' not found.\n", namespace))
+        format!("Namespace '{namespace}' not found.\n")
     }
 }
 
@@ -1365,10 +1311,10 @@ async fn handle_client(
         ["DELETE", namespace, name] => delete_workflow(namespace, name, &db, scheduler).await?,
         ["RUN", namespace, name] => run_workflow(namespace, name, &db, scheduler).await?,
         ["SET_ENV", namespace, name, key, value] => {
-            set_env(namespace, name, key, value, &db, scheduler).await?
+            set_env(namespace, name, key, value, &db, &scheduler)
         }
-        ["GET_ENV", namespace, name, key] => get_env(namespace, name, key, &db, scheduler).await?,
-        ["LIST_ENV", namespace, name] => list_env(namespace, name, &db, scheduler).await?,
+        ["GET_ENV", namespace, name, key] => get_env(namespace, name, key, &db, &scheduler),
+        ["LIST_ENV", namespace, name] => list_env(namespace, name, &db, &scheduler),
         _ => {
             warn!(command = %line.trim(), "Invalid command received");
             "Invalid command. Use ADD_NAMESPACE, LIST_NAMESPACES, REGISTER_DIR, ADD, LIST, GET, or DELETE.\n".to_string()

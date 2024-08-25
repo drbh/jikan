@@ -1,6 +1,7 @@
 use clap::{Arg, Command};
 use std::process::Command as ProcessCommand;
 
+#[allow(clippy::too_many_lines)]
 fn main() -> std::io::Result<()> {
     let location_when_cli_is_run = std::env::current_dir()?;
 
@@ -90,48 +91,43 @@ fn main() -> std::io::Result<()> {
         Some(("ADD", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
             let body = sub_m.get_one::<String>("body").unwrap();
-            format!("ADD {} {} {}", namespace, name, body)
+            format!("ADD {namespace} {name} {body}")
         }
         Some(("LIST", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
-            format!("LIST {}", namespace)
+                .map_or("default", String::as_str);
+            format!("LIST {namespace}")
         }
         Some(("GET", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
-            format!("GET {} {}", namespace, name)
+            format!("GET {namespace} {name}")
         }
         Some(("DELETE", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
-            format!("DELETE {} {}", namespace, name)
+            format!("DELETE {namespace} {name}")
         }
         Some(("RUN", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
-            format!("RUN {} {}", namespace, name)
+            format!("RUN {namespace} {name}")
         }
         Some(("ADD_NAMESPACE", sub_m)) => {
             let name = sub_m.get_one::<String>("name").unwrap();
             let path = sub_m.get_one::<String>("path").unwrap();
 
-            let path = if path.starts_with("/") {
+            let path = if path.starts_with('/') {
                 path.clone()
             } else {
                 location_when_cli_is_run
@@ -141,45 +137,42 @@ fn main() -> std::io::Result<()> {
                     .to_string()
             };
 
-            format!("ADD_NAMESPACE {} {}", name, path)
+            format!("ADD_NAMESPACE {name} {path}")
         }
         Some(("LIST_NAMESPACES", _)) => "LIST_NAMESPACES".to_string(),
         Some(("DELETE_NAMESPACE", sub_m)) => {
             let name = sub_m.get_one::<String>("name").unwrap();
-            format!("DELETE_NAMESPACE {}", name)
+            format!("DELETE_NAMESPACE {name}")
         }
         Some(("SET_ENV", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
             let key = sub_m.get_one::<String>("key").unwrap();
             let value = sub_m.get_one::<String>("value").unwrap();
-            format!("SET_ENV {} {} {} {}", namespace, name, key, value)
+            format!("SET_ENV {namespace} {name} {key} {value}")
         }
         Some(("GET_ENV", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
             let key = sub_m.get_one::<String>("key").unwrap();
-            format!("GET_ENV {} {} {}", namespace, name, key)
+            format!("GET_ENV {namespace} {name} {key}")
         }
         Some(("LIST_ENV", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
-            format!("LIST_ENV {} {}", namespace, name)
+            format!("LIST_ENV {namespace} {name}")
         }
         Some(("REGISTER_DIR", sub_m)) => {
             let namespace = sub_m.get_one::<String>("namespace").unwrap();
             let dir_path = sub_m.get_one::<String>("dir_path").unwrap();
 
-            let dir_path = if dir_path.starts_with("/") {
+            let dir_path = if dir_path.starts_with('/') {
                 dir_path.clone()
             } else {
                 location_when_cli_is_run
@@ -189,15 +182,14 @@ fn main() -> std::io::Result<()> {
                     .to_string()
             };
 
-            format!("REGISTER_DIR {} {}", namespace, dir_path)
+            format!("REGISTER_DIR {namespace} {dir_path}")
         }
         Some(("NEXT", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map(String::as_str)
-                .unwrap_or("default");
+                .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
-            format!("NEXT {} {}", namespace, name)
+            format!("NEXT {namespace} {name}")
         }
         Some(("init", _sub_m)) => {
             let namespace = location_when_cli_is_run
@@ -219,7 +211,7 @@ fn main() -> std::io::Result<()> {
 
     let output = ProcessCommand::new("sh")
         .arg("-c")
-        .arg(format!("echo '{}' | nc -w 1 localhost 8080", command))
+        .arg(format!("echo '{command}' | nc -w 1 localhost 8080"))
         .output()?;
 
     if output.status.success() {
