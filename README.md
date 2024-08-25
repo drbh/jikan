@@ -88,6 +88,31 @@ jikanctl next daily-brief daily-brief
 # Absolute time: Sun, 25 Aug 2024 14:07:00 -0400
 ```
 
+7. Run the workflow manually:
+
+```bash
+jikanctl run daily-brief daily-brief
+# Server response: Workflow 'daily-brief' in namespace 'daily-brief' ran successfully.
+```
+
+after running the workflow, you should see the output in the `daily_brief.md` file:
+
+```bash
+cat ./daily_brief.md
+# Good morning! Here's your daily brief:
+# Sunday, August 25, 2024
+# ## Today's Weather
+# jfk
+
+#      \  /       Partly cloudy
+#    _ /"".-.     +23(25) °C
+#      \_(   ).   ↑ 19 km/h
+#      /(___(__)  16 km
+#                 0.0 mm
+```
+
+🙌 awesome, you just registered and ran your first Jikan workflow!
+
 ## Core Concepts
 
 - **Workflows**: Defined tasks that Jikan executes based on triggers.
@@ -218,7 +243,7 @@ jikanctl register_dir [namespace] [dir_path]
 
 - Checking the next scheduled run:
 
-````bash
+```bash
 jikanctl next [namespace] [name]
 ```
 
@@ -235,4 +260,3 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 ## License
 
 Jikan is released under the [MIT License](LICENSE).
-````
