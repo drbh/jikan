@@ -34,6 +34,12 @@ pub struct Namespace {
     path: PathBuf,
 }
 
+impl Namespace {
+    fn new(name: String, path: PathBuf) -> Self {
+        Self { name, path }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WorkflowYaml {
     name: String,
@@ -450,7 +456,7 @@ fn run_forever(scheduler: Arc<Scheduler>) {
     });
 }
 
-fn initialize() -> std::io::Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
+fn initialize() -> Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -469,12 +475,9 @@ fn initialize() -> std::io::Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
     std::fs::create_dir_all(&database_dir)?;
 
     let database_path = database_dir.join("jikan.redb");
-    let db = Arc::new(Mutex::new(Database::create(database_path).map_err(
-        |e| {
-            error!(error = %e, "Failed to create database");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        },
-    )?));
+    let db = Arc::new(Mutex::new(
+        Database::create(database_path).context("Failed to create database")?,
+    ));
 
     let scheduler: Arc<Scheduler> = Arc::new(Scheduler::new());
 
@@ -488,7 +491,7 @@ fn initialize() -> std::io::Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
     Ok((db, scheduler))
 }
 
-fn daemonize() -> std::io::Result<()> {
+fn daemonize() -> Result<()> {
     let pid_file = "/tmp/jikan.pid";
     let working_dir = "/tmp";
 
@@ -506,19 +509,10 @@ fn daemonize() -> std::io::Result<()> {
         .stdout(stdout)
         .stderr(stderr);
 
-    match daemonize.start() {
-        Ok(()) => {
-            info!("Successfully daemonized");
-            Ok(())
-        }
-        Err(e) => {
-            error!(error = %e, "Error daemonizing process");
-            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
-        }
-    }
+    daemonize.start().context("Error daemonizing process")
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let run_in_background = args.get(1).map_or(false, |arg| arg == "daemon");
 
@@ -526,17 +520,12 @@ fn main() -> std::io::Result<()> {
 
     if should_stop {
         let pid_file = "/tmp/jikan.pid";
-        let pid = std::fs::read_to_string(pid_file).map_err(|_e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to read PID file. Is the daemon running?",
-            )
-        })?;
-        let pid = pid.trim().parse::<i32>().map_err(|_e| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Failed to parse PID file")
-        })?;
+        let pid = std::fs::read_to_string(pid_file)
+            .context("Failed to read PID file. Is the daemon running?")?
+            .trim()
+            .parse::<i32>()
+            .context("Failed to parse PID file. Is the daemon running?")?;
         unsafe {
-            // libc::kill(pid, libc::SIGTERM);
             // gracefully stop the daemon
             libc::kill(pid, libc::SIGINT);
         }
@@ -560,9 +549,7 @@ fn main() -> std::io::Result<()> {
 
 #[instrument(skip(db, scheduler))]
 fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: Arc<Scheduler>) -> Result<()> {
-    let db_guard = db
-        .lock()
-        .map_err(|e| anyhow::anyhow!("Failed to lock database: {}", e))?;
+    let db_guard = db.lock().unwrap();
     let read_txn = db_guard
         .begin_read()
         .context("Failed to begin read transaction")?;
@@ -598,8 +585,8 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: Arc<Scheduler>) -> Re
             .with_context(|| format!("Failed to get namespace: {namespace}"))?
             .ok_or_else(|| anyhow::anyhow!("Namespace not found: {namespace}"))?;
 
-        let namespace_obj: Namespace = serde_json::from_str(namespace_entry.value())
-            .with_context(|| format!("Failed to parse namespace: {namespace}"))?;
+        let namespace_obj: Namespace =
+            serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace")?;
 
         match serde_yaml::from_str(yaml_content.value()) {
             Ok(config) => {
@@ -625,7 +612,7 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: Arc<Scheduler>) -> Re
 async fn start_server_and_scheduler(
     db: Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
-) -> std::io::Result<()> {
+) -> Result<()> {
     // start the scheduler
     let scheduler_clone = Arc::clone(&scheduler);
     tokio::spawn(async move {
@@ -643,19 +630,18 @@ async fn start_server_and_scheduler(
         let db = db.lock().unwrap();
         let write_txn = db
             .begin_write()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .context("Failed to begin write transaction")?;
         {
             write_txn
                 .open_table(NAMESPACES)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .context("Failed to open namespaces table")?;
+
             write_txn
                 .open_table(WORKFLOWS)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .context("Failed to open workflows table")?;
         }
 
-        write_txn
-            .commit()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        write_txn.commit().context("Failed to commit transaction")?;
     }
 
     loop {
@@ -677,23 +663,18 @@ async fn delete_namespace(
     name: &str,
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
+) -> Result<String> {
     let db = db.lock().unwrap();
     let write_txn = db
         .begin_write()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .context("Failed to begin write transaction")?;
     {
         let mut table = write_txn
             .open_table(NAMESPACES)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        table.remove(name).map_err(|e| {
-            error!(error = %e, namespace = name, "Failed to remove namespace");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+            .context("Failed to open namespaces table")?;
+        table.remove(name).context("Failed to remove namespace")?;
     }
-    write_txn
-        .commit()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    write_txn.commit().context("Failed to commit transaction")?;
 
     let mut scheduler = scheduler.jobs.write();
     scheduler.remove(name);
@@ -702,61 +683,43 @@ async fn delete_namespace(
 }
 
 #[instrument(skip(db))]
-async fn add_namespace(
-    name: &str,
-    path: &str,
-    db: &Arc<Mutex<Database>>,
-) -> std::io::Result<String> {
+async fn add_namespace(name: &str, path: &str, db: &Arc<Mutex<Database>>) -> Result<String> {
     if path.starts_with('.') {
         return Ok("Invalid directory path. Please provide an absolute path.".to_string());
     }
-
-    let namespace = Namespace {
-        name: name.to_string(),
-        path: PathBuf::from(path),
-    };
-
+    let namespace = Namespace::new(name.to_string(), PathBuf::from(path));
     let db = db.lock().unwrap();
     let write_txn = db
         .begin_write()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .context("Failed to begin write transaction")?;
     {
         let mut table = write_txn
             .open_table(NAMESPACES)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .context("Failed to open namespaces table")?;
         table
             .insert(name, serde_json::to_string(&namespace).unwrap().as_str())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .context("Failed to insert namespace")?;
     }
-    write_txn
-        .commit()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    write_txn.commit().context("Failed to commit transaction")?;
 
     Ok(format!("Namespace '{name}' added successfully.\n"))
 }
 
 #[instrument(skip(db))]
-async fn list_namespaces(db: &Arc<Mutex<Database>>) -> std::io::Result<String> {
+async fn list_namespaces(db: &Arc<Mutex<Database>>) -> Result<String> {
     let db = db.lock().unwrap();
-    let read_txn = db.begin_read().map_err(|e| {
-        error!(error = %e, "Failed to begin read transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
-    let table = read_txn.open_table(NAMESPACES).map_err(|e| {
-        error!(error = %e, "Failed to open namespaces table");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let read_txn = db
+        .begin_read()
+        .context("Failed to begin read transaction")?;
+    let table = read_txn
+        .open_table(NAMESPACES)
+        .context("Failed to open namespaces table")?;
 
     let mut response = String::from("Namespaces:\n");
-    for result in table.iter().map_err(|e| {
-        error!(error = %e, "Failed to iterate over namespaces");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })? {
-        let (name, data) = result.map_err(|e| {
-            error!(error = %e, "Failed to read namespace entry");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
-        let namespace: Namespace = serde_json::from_str(data.value()).unwrap();
+    for result in table.iter().context("Failed to iterate over namespaces")? {
+        let (name, data) = result.context("Failed to read namespace entry")?;
+        let namespace: Namespace =
+            serde_json::from_str(data.value()).context("Failed to parse namespace data")?;
 
         response.push_str(&format!(
             "- {} (path: {})\n",
@@ -776,50 +739,39 @@ async fn add_workflow(
     yaml_content: &str,
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
-    let config: WorkflowYaml = serde_yaml::from_str(yaml_content)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+) -> Result<String> {
+    let config: WorkflowYaml =
+        serde_yaml::from_str(yaml_content).context("Failed to parse workflow YAML")?;
 
     let db = db.lock().unwrap();
     let write_txn = db
         .begin_write()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .context("Failed to begin write transaction")?;
     {
         let mut table = write_txn
             .open_table(WORKFLOWS)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .context("Failed to open workflows table")?;
         table
             .insert((namespace, name), yaml_content)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .context("Failed to insert workflow")?;
     }
-    write_txn
-        .commit()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    write_txn.commit().context("Failed to commit transaction")?;
 
-    let read_txn = db.begin_read().map_err(|e| {
-        error!(error = %e, "Failed to begin read transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let read_txn = db
+        .begin_read()
+        .context("Failed to begin read transaction")?;
 
     let namespace_table = read_txn
         .open_table(NAMESPACES)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .context("Failed to open namespaces table")?;
 
     let namespace_entry = namespace_table
         .get(namespace)
-        .map_err(|e| {
-            error!(error = %e, namespace = namespace, "Failed to get namespace");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?
-        .ok_or_else(|| {
-            error!(namespace = namespace, "Namespace not found");
-            std::io::Error::new(std::io::ErrorKind::NotFound, "Namespace not found")
-        })?;
+        .context("Failed to get namespace")?
+        .ok_or_else(|| anyhow::anyhow!("Namespace not found: {}", namespace))?;
 
-    let namespace_obj: Namespace = serde_json::from_str(namespace_entry.value()).map_err(|e| {
-        error!(error = %e, namespace = namespace, "Failed to parse namespace");
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let namespace_obj: Namespace =
+        serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace data")?;
 
     scheduler.add(namespace, Box::new(WorkflowJob::new(config, namespace_obj)));
 
@@ -834,7 +786,7 @@ async fn register_workflows_from_dir(
     dir_path: &str,
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
+) -> Result<String> {
     let mut registered = 0;
 
     let namespace_path = PathBuf::from(dir_path);
@@ -854,25 +806,20 @@ async fn register_workflows_from_dir(
         let db = db.lock().unwrap();
         let write_txn = db
             .begin_write()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .context("Failed to begin write transaction")?;
         {
             let mut table = write_txn
                 .open_table(NAMESPACES)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            let new_namespace = Namespace {
-                name: namespace.to_string(),
-                path: namespace_path.clone(),
-            };
+                .context("Failed to open namespaces table")?;
+            let new_namespace = Namespace::new(namespace.to_string(), namespace_path.clone());
             table
                 .insert(
                     namespace,
                     serde_json::to_string(&new_namespace).unwrap().as_str(),
                 )
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .context("Failed to insert namespace")?;
         }
-        write_txn
-            .commit()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        write_txn.commit().context("Failed to commit transaction")?;
     }
 
     for entry in WalkDir::new(workspace_path.clone())
@@ -917,21 +864,19 @@ async fn run_workflow(
     name: &str,
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
+) -> Result<String> {
     let db = db.lock().unwrap();
-    let read_txn = db.begin_read().map_err(|e| {
-        error!(error = %e, "Failed to begin read transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
-    let table = read_txn.open_table(WORKFLOWS).map_err(|e| {
-        error!(error = %e, "Failed to open workflows table");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let read_txn = db
+        .begin_read()
+        .context("Failed to begin read transaction")?;
+    let table = read_txn
+        .open_table(WORKFLOWS)
+        .context("Failed to open workflows table")?;
 
-    if let Some(_workflow) = table.get((namespace, name)).map_err(|e| {
-        error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })? {
+    if let Some(_workflow) = table
+        .get((namespace, name))
+        .context("Failed to get workflow")?
+    {
         // find the job in the scheduler
         let jobs = scheduler.jobs.read();
         let job = jobs
@@ -984,29 +929,18 @@ async fn run_workflow(
 }
 
 #[instrument(skip(db))]
-async fn list_workflows(
-    namespace: Option<&str>,
-    db: &Arc<Mutex<Database>>,
-) -> std::io::Result<String> {
+async fn list_workflows(namespace: Option<&str>, db: &Arc<Mutex<Database>>) -> Result<String> {
     let db = db.lock().unwrap();
-    let read_txn = db.begin_read().map_err(|e| {
-        error!(error = %e, "Failed to begin read transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
-    let table = read_txn.open_table(WORKFLOWS).map_err(|e| {
-        error!(error = %e, "Failed to open workflows table");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let read_txn = db
+        .begin_read()
+        .context("Failed to begin read transaction")?;
+    let table = read_txn
+        .open_table(WORKFLOWS)
+        .context("Failed to open workflows table")?;
 
     let mut response = String::from("Workflows:\n");
-    for result in table.iter().map_err(|e| {
-        error!(error = %e, "Failed to iterate over workflows");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })? {
-        let (key, _value) = result.map_err(|e| {
-            error!(error = %e, "Failed to read workflow entry");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+    for result in table.iter().context("Failed to iterate over workflows")? {
+        let (key, _value) = result.context("Failed to read workflow entry")?;
 
         let (ns, name) = key.value();
 
@@ -1020,25 +954,19 @@ async fn list_workflows(
 }
 
 #[instrument(skip(db))]
-async fn get_workflow(
-    namespace: &str,
-    name: &str,
-    db: &Arc<Mutex<Database>>,
-) -> std::io::Result<String> {
+async fn get_workflow(namespace: &str, name: &str, db: &Arc<Mutex<Database>>) -> Result<String> {
     let db = db.lock().unwrap();
-    let read_txn = db.begin_read().map_err(|e| {
-        error!(error = %e, "Failed to begin read transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
-    let table = read_txn.open_table(WORKFLOWS).map_err(|e| {
-        error!(error = %e, "Failed to open workflows table");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let read_txn = db
+        .begin_read()
+        .context("Failed to begin read transaction")?;
+    let table = read_txn
+        .open_table(WORKFLOWS)
+        .context("Failed to open workflows table")?;
 
-    if let Some(workflow) = table.get((namespace, name)).map_err(|e| {
-        error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })? {
+    if let Some(workflow) = table
+        .get((namespace, name))
+        .context("Failed to get workflow")?
+    {
         info!(
             namespace = namespace,
             workflow = name,
@@ -1062,26 +990,20 @@ async fn delete_workflow(
     name: &str,
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
-) -> std::io::Result<String> {
+) -> Result<String> {
     let db = db.lock().unwrap();
-    let write_txn = db.begin_write().map_err(|e| {
-        error!(error = %e, "Failed to begin write transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let write_txn = db
+        .begin_write()
+        .context("Failed to begin write transaction")?;
     {
-        let mut table = write_txn.open_table(WORKFLOWS).map_err(|e| {
-            error!(error = %e, "Failed to open workflows table");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
-        table.remove((namespace, name)).map_err(|e| {
-            error!(error = %e, namespace = namespace, workflow = name, "Failed to remove workflow");
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let mut table = write_txn
+            .open_table(WORKFLOWS)
+            .context("Failed to open workflows table")?;
+        table
+            .remove((namespace, name))
+            .context("Failed to remove workflow")?;
     }
-    write_txn.commit().map_err(|e| {
-        error!(error = %e, "Failed to commit transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    write_txn.commit().context("Failed to commit transaction")?;
 
     scheduler.remove(namespace, name);
 
@@ -1100,45 +1022,33 @@ async fn get_next_run_workflow(
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
-) -> std::io::Result<String> {
+) -> Result<String> {
     let db = db.lock().unwrap();
-    let read_txn = db.begin_read().map_err(|e| {
-        error!(error = %e, "Failed to begin read transaction");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
-    let table = read_txn.open_table(WORKFLOWS).map_err(|e| {
-        error!(error = %e, "Failed to open workflows table");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let read_txn = db
+        .begin_read()
+        .context("Failed to begin read transaction")?;
+    let table = read_txn
+        .open_table(WORKFLOWS)
+        .context("Failed to open workflows table")?;
 
-    let namespace_table = read_txn.open_table(NAMESPACES).map_err(|e| {
-        error!(error = %e, "Failed to open namespaces table");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
+    let namespace_table = read_txn
+        .open_table(NAMESPACES)
+        .context("Failed to open namespaces table")?;
 
-    if let Some(workflow) = table.get((namespace, name)).map_err(|e| {
-        error!(error = %e, namespace = namespace, workflow = name, "Failed to get workflow");
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })? {
-        let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(workflow) = table
+        .get((namespace, name))
+        .context("Failed to get workflow")?
+    {
+        let config: WorkflowYaml =
+            serde_yaml::from_str(workflow.value()).context("Failed to parse workflow YAML")?;
 
         let namespace_entry = namespace_table
             .get(namespace)
-            .map_err(|e| {
-                error!(error = %e, namespace = namespace, "Failed to get namespace");
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            })?
-            .ok_or_else(|| {
-                error!(namespace = namespace, "Namespace not found");
-                std::io::Error::new(std::io::ErrorKind::NotFound, "Namespace not found")
-            })?;
+            .context("Failed to get namespace")?
+            .ok_or_else(|| anyhow::anyhow!("Namespace not found"))?;
 
         let namespace_obj: Namespace =
-            serde_json::from_str(namespace_entry.value()).map_err(|e| {
-                error!(error = %e, namespace = namespace, "Failed to parse namespace");
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            })?;
+            serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace")?;
 
         let job = WorkflowJob::new(config, namespace_obj);
         let cron = job.cron();
@@ -1286,7 +1196,7 @@ async fn handle_client(
     stream: TcpStream,
     db: Arc<Mutex<Database>>,
     scheduler: Arc<Scheduler>,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let mut stream = TokioTcpStream::from_std(stream)?;
     let (reader, mut writer) = stream.split();
     let mut reader = tokio::io::BufReader::new(reader);
