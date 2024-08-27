@@ -374,7 +374,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jikanctl"
+name = "jk"
 version = "0.1.0"
 dependencies = [
  "clap",

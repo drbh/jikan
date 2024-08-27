@@ -26,7 +26,7 @@ Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, off
 # install the daemon
 cargo install --git https://github.com/drbh/jikan.git jikan
 # install the CLI
-cargo install --git https://github.com/drbh/jikan.git jikanctl
+cargo install --git https://github.com/drbh/jikan.git jk
 ```
 
 2. Start the Jikan daemon:
@@ -68,14 +68,14 @@ jobs:
 
 ```bash
 cd example/daily-brief
-jikanctl init
+jk init
 # Server response: Registered 1 workflows in namespace 'daily-brief'.
 ```
 
 5. List your workflows:
 
 ```bash
-jikanctl list daily-brief
+jk list daily-brief
 # Server response: Workflows:
 # - daily-brief (namespace: daily-brief)
 ```
@@ -83,7 +83,7 @@ jikanctl list daily-brief
 6. See the next scheduled run:
 
 ```bash
-jikanctl next daily-brief daily-brief
+jk next daily-brief daily-brief
 # Server response: Workflow 'daily-brief' in namespace 'daily-brief' will run in 1239 seconds.
 # Absolute time: Sun, 25 Aug 2024 14:07:00 -0400
 ```
@@ -91,7 +91,7 @@ jikanctl next daily-brief daily-brief
 7. Run the workflow manually:
 
 ```bash
-jikanctl run daily-brief daily-brief
+jk run daily-brief daily-brief
 # Server response: Workflow 'daily-brief' in namespace 'daily-brief' ran successfully.
 ```
 
@@ -125,13 +125,13 @@ cat ./daily_brief.md
 1. Start the Jikan daemon:
 
 ```bash
-jikanctl --help
+jk --help
 ```
 
-2. Use the `jikanctl` tool to interact with Jikan:
+2. Use the `jk` tool to interact with Jikan:
 
 ```bash
-jikanctl command [arguments]
+jk command [arguments]
 ```
 
 ## Workflow Configuration
@@ -166,31 +166,31 @@ Learn more about syntax and how it compares to Github Actions in [SYNTAX.md](SYN
 - Add a workflow:
 
 ```bash
-jikanctl add [namespace] [name] [body]
+jk add [namespace] [name] [body]
 ```
 
 - List workflows:
 
 ```bash
-jikanctl list [namespace]
+jk list [namespace]
 ```
 
 - Get workflow details:
 
 ```bash
-jikanctl get [namespace] [name]
+jk get [namespace] [name]
 ```
 
 - Delete a workflow:
 
 ```bash
-jikanctl delete [namespace] [name]
+jk delete [namespace] [name]
 ```
 
 - Run a workflow:
 
 ```bash
-jikanctl run [namespace] [name]
+jk run [namespace] [name]
 ```
 
 ### Namespace Management
@@ -198,19 +198,19 @@ jikanctl run [namespace] [name]
 - Add a namespace:
 
 ```bash
-jikanctl add_namespace [name] [path]
+jk add_namespace [name] [path]
 ```
 
 - List namespaces:
 
 ```bash
-jikanctl list_namespaces
+jk list_namespaces
 ```
 
 - Delete a namespace:
 
 ```bash
-jikanctl delete_namespace [name]
+jk delete_namespace [name]
 ```
 
 ### Environment Variables
@@ -218,19 +218,19 @@ jikanctl delete_namespace [name]
 - Set an environment variable:
 
 ```bash
-jikanctl set_env [namespace] [name] [key] [value]
+jk set_env [namespace] [name] [key] [value]
 ```
 
 - Get an environment variable:
 
 ```bash
-jikanctl get_env [namespace] [name] [key]
+jk get_env [namespace] [name] [key]
 ```
 
 - List environment variables:
 
 ```bash
-jikanctl list_env [namespace] [name]
+jk list_env [namespace] [name]
 ```
 
 ## Advanced Usage
@@ -238,13 +238,13 @@ jikanctl list_env [namespace] [name]
 - Registering directory-based workflows:
 
 ```bash
-jikanctl register_dir [namespace] [dir_path]
+jk register_dir [namespace] [dir_path]
 ```
 
 - Checking the next scheduled run:
 
 ```bash
-jikanctl next [namespace] [name]
+jk next [namespace] [name]
 ```
 
 ## Troubleshooting

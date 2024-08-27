@@ -1,6 +1,7 @@
 .bak
 /target
 jikan.redb
+**/.jikan/logs/*
 
 workflows/*.yaml
 !workflows/workflow-now.yaml

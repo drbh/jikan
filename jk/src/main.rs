@@ -5,10 +5,12 @@ use std::process::Command as ProcessCommand;
 fn main() -> std::io::Result<()> {
     let location_when_cli_is_run = std::env::current_dir()?;
 
-    let matches = Command::new("jikanctl")
+    let matches = Command::new("jk")
         .version("1.0")
-        .author("Your Name")
+        .author("David Holtz (drbh)")
         .about("Control interface for Jikan workflow execution daemon")
+        // allow --format=json to be passed to all subcommands
+        .arg(Arg::new("json").short('j').long("json"))
         .subcommand(
             Command::new("add")
                 .about("Add a workflow")
@@ -37,7 +39,8 @@ fn main() -> std::io::Result<()> {
             Command::new("run")
                 .about("Run a workflow")
                 .arg(Arg::new("namespace").required(false))
-                .arg(Arg::new("name").required(true)),
+                .arg(Arg::new("name").required(true))
+                .arg(Arg::new("args").required(false)),
         )
         .subcommand(
             Command::new("add_namespace")
@@ -45,7 +48,7 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("name").required(true))
                 .arg(Arg::new("path").required(true)),
         )
-        .subcommand(Command::new("LIST_NAMESPACES").about("List namespaces"))
+        .subcommand(Command::new("list_namespaces").about("List namespaces"))
         .subcommand(
             Command::new("delete_namespace")
                 .about("Delete a namespace")
@@ -84,7 +87,14 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true)),
         )
+        .subcommand(
+            Command::new("last")
+                .about("Check the last run")
+                .arg(Arg::new("namespace").required(false))
+                .arg(Arg::new("name").required(true)),
+        )
         .subcommand(Command::new("init").about("Initialize a new Jikan project"))
+        .subcommand(Command::new("daemon_info").about("Get daemon info"))
         .get_matches();
 
     let command = match matches.subcommand() {
@@ -121,7 +131,8 @@ fn main() -> std::io::Result<()> {
                 .get_one::<String>("namespace")
                 .map_or("default", String::as_str);
             let name = sub_m.get_one::<String>("name").unwrap();
-            format!("RUN {namespace} {name}")
+            let args = sub_m.get_one::<String>("args").map_or("", String::as_str);
+            format!("RUN {namespace} {name} {args}")
         }
         Some(("add_namespace", sub_m)) => {
             let name = sub_m.get_one::<String>("name").unwrap();
@@ -140,8 +151,9 @@ fn main() -> std::io::Result<()> {
             format!("ADD_NAMESPACE {name} {path}")
         }
         Some(("list_namespaces", _)) => "LIST_NAMESPACES".to_string(),
-        Some(("DELETE_NAMESPACE", sub_m)) => {
-            let name = sub_m.get_one::<String>("name").unwrap();
+        Some(("daemon_info", _sub_m)) => "DAEMON_INFO".to_string(),
+        Some(("delete_namespace", sub_m)) => {
+            let name: &String = sub_m.get_one::<String>("name").unwrap();
             format!("DELETE_NAMESPACE {name}")
         }
         Some(("set_env", sub_m)) => {
@@ -191,6 +203,13 @@ fn main() -> std::io::Result<()> {
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("NEXT {namespace} {name}")
         }
+        Some(("last", sub_m)) => {
+            let namespace = sub_m
+                .get_one::<String>("namespace")
+                .map_or("default", String::as_str);
+            let name = sub_m.get_one::<String>("name").unwrap();
+            format!("LAST {namespace} {name}")
+        }
         Some(("init", _sub_m)) => {
             let namespace = location_when_cli_is_run
                 .file_name()
@@ -216,7 +235,7 @@ fn main() -> std::io::Result<()> {
 
     if output.status.success() {
         let response = String::from_utf8_lossy(&output.stdout);
-        println!("Server response: {}", response.trim());
+        println!("{}", response.trim());
     } else {
         let error = String::from_utf8_lossy(&output.stderr);
         eprintln!("Error: {}", error.trim());

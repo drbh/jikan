@@ -1,6 +1,6 @@
 [workspace]
-members = ["jikan", "jikanctl"]
-default-members = ["jikan", "jikanctl"]
+members = ["jikan", "jk"]
+default-members = ["jikan", "jk"]
 resolver = "2"
 
 [workspace.package]
