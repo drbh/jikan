@@ -45,7 +45,7 @@ jikand stop
 name: hello-world
 on:
   schedule:
-    - cron: "0 * * * * * *" # Run every minute
+    - cron: "0 0 * * * * *" # Run every minute
 jobs:
   say-hello:
     runs-on: bash
