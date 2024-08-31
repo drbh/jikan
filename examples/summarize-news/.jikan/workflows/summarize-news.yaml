@@ -1,0 +1,19 @@
+name: summarize-news
+on:
+  schedule:
+    - cron: "0 0 0 * * * *"
+
+env:
+  ENV_VAR: "some_value"
+
+jobs:
+  example-job:
+    if: "{{ env.ENV_VAR == 'some_value' }}"
+    runs-on: bash
+    steps:
+      - run: echo $OTHER_ENV_VAR
+  python-job:
+    runs-on:
+      python-external: .venv/bin/python
+    steps:
+      - run: func.py

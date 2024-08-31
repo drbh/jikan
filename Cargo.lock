@@ -352,16 +352,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b"
 
 [[package]]
-name = "jikan"
+name = "jikand"
 version = "0.1.0"
 dependencies = [
  "actix-rt",
  "anyhow",
  "chrono",
+ "clap",
  "cron",
  "daemonize",
  "dirs",
  "libc",
+ "minijinja",
  "parking_lot",
  "redb",
  "serde",
@@ -441,6 +443,15 @@ name = "memchr"
 version = "2.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
+
+[[package]]
+name = "minijinja"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d7d3e3a3eece1fa4618237ad41e1de855ced47eab705cec1c9a920e1d1c5aad"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "minimal-lexical"

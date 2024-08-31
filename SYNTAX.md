@@ -66,7 +66,7 @@ Example:
 ```yaml
 on:
   schedule:
-    - cron: "0 0 * * * * *" # Run daily at midnight
+    - cron: "0 0 0 * * * *" # Run daily at midnight
 ```
 
 The cron syntax in Jikan uses 7 fields: second, minute, hour, day of month, month, day of week, year.
@@ -131,7 +131,7 @@ env:
   WORKFLOW_ENV: "test"
 on:
   schedule:
-    - cron: "0 * * * * * *" # every minute
+    - cron: "0 0 * * * * *" # every minute
 jobs:
   # ... jobs defined here
 ```
@@ -181,7 +181,7 @@ You can use the `if` keyword at the job level to conditionally run entire jobs:
 ```yaml
 jobs:
   conditional-job:
-    if: "ENV_VAR=some_value"
+    if: "{{ env.ENV_VAR == 'some_value' }}"
     runs-on: bash
     steps:
       - run: echo "This job only runs if ENV_VAR equals some_value"
@@ -191,16 +191,10 @@ In this example, the `conditional-job` will only run if the environment variable
 
 ### Syntax for Conditionals
 
-The `if` condition supports basic equality checks:
+The `if` condition supports equality checks and uses minijinja templating syntax. Here are some examples:
 
-- `ENV_VAR=value`: Checks if an environment variable equals a specific value
-- `ENV_VAR!=value`: Checks if an environment variable does not equal a specific value
-
-### Limitations
-
-- Currently, Jikan only supports simple equality checks in conditionals.
-- More complex conditions (like greater than, less than, or combining multiple conditions) are not supported.
-- Conditionals are only available at the job level, not for individual steps.
+- `{{ env.ENV_VAR == 'some_value' }}`: Checks if an environment variable equals a specific value
+- `{{ env.ENV_VAR != 'some_value' }}`: Checks if an environment variable does not equal a specific value
 
 ### Example Workflow with Conditionals
 
@@ -213,10 +207,10 @@ env:
   WORKFLOW_ENV: "test"
 on:
   schedule:
-    - cron: "0 * * * * * *" # every minute
+    - cron: "0 0 * * * * *" # every minute
 jobs:
   conditional-job:
-    if: "ENV_VAR=some_value"
+    if: "{{ env.WORKFLOW_ENV == 'test' }}"
     runs-on: bash
     env:
       STEP_ENV_NAME: "drbh"

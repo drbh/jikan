@@ -12,13 +12,6 @@ fn main() -> std::io::Result<()> {
         // allow --format=json to be passed to all subcommands
         .arg(Arg::new("json").short('j').long("json"))
         .subcommand(
-            Command::new("add")
-                .about("Add a workflow")
-                .arg(Arg::new("namespace").required(false))
-                .arg(Arg::new("name").required(true))
-                .arg(Arg::new("body").required(true)),
-        )
-        .subcommand(
             Command::new("list")
                 .about("List workflows")
                 .arg(Arg::new("namespace").required(false)),
@@ -30,30 +23,13 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(
-            Command::new("delete")
-                .about("Delete a workflow")
-                .arg(Arg::new("namespace").required(false))
-                .arg(Arg::new("name").required(true)),
-        )
-        .subcommand(
             Command::new("run")
                 .about("Run a workflow")
                 .arg(Arg::new("namespace").required(false))
                 .arg(Arg::new("name").required(true))
                 .arg(Arg::new("args").required(false)),
         )
-        .subcommand(
-            Command::new("add_namespace")
-                .about("Add a namespace")
-                .arg(Arg::new("name").required(true))
-                .arg(Arg::new("path").required(true)),
-        )
         .subcommand(Command::new("list_namespaces").about("List namespaces"))
-        .subcommand(
-            Command::new("delete_namespace")
-                .about("Delete a namespace")
-                .arg(Arg::new("name").required(true)),
-        )
         .subcommand(
             Command::new("set_env")
                 .about("Set an environment variable")
@@ -76,12 +52,6 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(
-            Command::new("register_dir")
-                .about("Register directory-based workflows")
-                .arg(Arg::new("namespace").required(true))
-                .arg(Arg::new("dir_path").required(true)),
-        )
-        .subcommand(
             Command::new("next")
                 .about("Check the next scheduled run")
                 .arg(Arg::new("namespace").required(false))
@@ -94,22 +64,15 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("name").required(true)),
         )
         .subcommand(Command::new("init").about("Initialize a new Jikan project"))
+        .subcommand(Command::new("sync").about("Reload workflows in the current namespace"))
         .subcommand(Command::new("daemon_info").about("Get daemon info"))
         .get_matches();
 
     let command = match matches.subcommand() {
-        Some(("add", sub_m)) => {
-            let namespace = sub_m
-                .get_one::<String>("namespace")
-                .map_or("default", String::as_str);
-            let name = sub_m.get_one::<String>("name").unwrap();
-            let body = sub_m.get_one::<String>("body").unwrap();
-            format!("ADD {namespace} {name} {body}")
-        }
         Some(("list", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
-                .map_or("default", String::as_str);
+                .map_or("", String::as_str);
             format!("LIST {namespace}")
         }
         Some(("get", sub_m)) => {
@@ -119,13 +82,6 @@ fn main() -> std::io::Result<()> {
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("GET {namespace} {name}")
         }
-        Some(("delete", sub_m)) => {
-            let namespace = sub_m
-                .get_one::<String>("namespace")
-                .map_or("default", String::as_str);
-            let name = sub_m.get_one::<String>("name").unwrap();
-            format!("DELETE {namespace} {name}")
-        }
         Some(("run", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
@@ -134,28 +90,8 @@ fn main() -> std::io::Result<()> {
             let args = sub_m.get_one::<String>("args").map_or("", String::as_str);
             format!("RUN {namespace} {name} {args}")
         }
-        Some(("add_namespace", sub_m)) => {
-            let name = sub_m.get_one::<String>("name").unwrap();
-            let path = sub_m.get_one::<String>("path").unwrap();
-
-            let path = if path.starts_with('/') {
-                path.clone()
-            } else {
-                location_when_cli_is_run
-                    .join(path)
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-            };
-
-            format!("ADD_NAMESPACE {name} {path}")
-        }
         Some(("list_namespaces", _)) => "LIST_NAMESPACES".to_string(),
         Some(("daemon_info", _sub_m)) => "DAEMON_INFO".to_string(),
-        Some(("delete_namespace", sub_m)) => {
-            let name: &String = sub_m.get_one::<String>("name").unwrap();
-            format!("DELETE_NAMESPACE {name}")
-        }
         Some(("set_env", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
@@ -180,22 +116,6 @@ fn main() -> std::io::Result<()> {
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("LIST_ENV {namespace} {name}")
         }
-        Some(("register_dir", sub_m)) => {
-            let namespace = sub_m.get_one::<String>("namespace").unwrap();
-            let dir_path = sub_m.get_one::<String>("dir_path").unwrap();
-
-            let dir_path = if dir_path.starts_with('/') {
-                dir_path.clone()
-            } else {
-                location_when_cli_is_run
-                    .join(dir_path)
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-            };
-
-            format!("REGISTER_DIR {namespace} {dir_path}")
-        }
         Some(("next", sub_m)) => {
             let namespace = sub_m
                 .get_one::<String>("namespace")
@@ -210,12 +130,16 @@ fn main() -> std::io::Result<()> {
             let name = sub_m.get_one::<String>("name").unwrap();
             format!("LAST {namespace} {name}")
         }
-        Some(("init", _sub_m)) => {
+        Some(("init" | "sync", _sub_m)) => {
             let namespace = location_when_cli_is_run
                 .file_name()
                 .unwrap()
                 .to_str()
                 .unwrap();
+
+            // add directories if they don't exist
+            let _ = std::fs::create_dir_all(".jikan/workflows");
+
             format!(
                 "REGISTER_DIR {} {}",
                 namespace,

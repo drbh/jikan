@@ -1,5 +1,5 @@
 [package]
-name = "jikan"
+name = "jikand"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,10 +7,12 @@ edition = "2021"
 actix-rt = "2.10.0"
 anyhow = "1.0.86"
 chrono = "0.4.38"
+clap = "4.5.16"
 cron = "0.12.1"
 daemonize = "0.5.0"
 dirs = "5.0.1"
 libc = "0.2.158"
+minijinja = "2.2.0"
 parking_lot = "0.12.3"
 redb = "2.1.1"
 serde = { version = "1.0.208", features = ["derive"] }

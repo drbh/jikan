@@ -2,6 +2,7 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use cron::Schedule as CronSchedule;
 use daemonize::Daemonize;
+use minijinja::{context, Environment};
 use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -122,6 +123,13 @@ trait JobTrait: Send + Sync {
     fn downcast_ref_to_workflow_job(&self) -> Option<&WorkflowJob>;
 }
 
+// convert a JobTrait to a WorkflowJob with From and Into
+impl From<Box<dyn JobTrait>> for WorkflowJob {
+    fn from(job: Box<dyn JobTrait>) -> Self {
+        job.downcast_ref_to_workflow_job().unwrap().clone()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Context {
     env: HashMap<String, String>,
@@ -196,6 +204,7 @@ impl JobTrait for WorkflowJob {
 
     #[instrument(skip(self), fields(workflow_name = %self.config.name))]
     fn run(&mut self, event: RunEvent) -> Result<RunResults, String> {
+        println!("Running workflow");
         let job_id = Local::now().format("%Y%m%d%H%M%S").to_string();
 
         let mut logfiles = vec![];
@@ -244,8 +253,10 @@ impl JobTrait for WorkflowJob {
                     info!(step = index, command = run, "Executing step");
 
                     // if valid filepath read the contents as a string
-                    let run = if std::path::Path::new(run).exists() {
-                        std::fs::read_to_string(run).unwrap()
+                    let possible_path = working_dir.clone().join(run);
+
+                    let run = if possible_path.exists() {
+                        std::fs::read_to_string(possible_path).unwrap()
                     } else {
                         run.clone()
                     };
@@ -294,16 +305,21 @@ impl JobTrait for WorkflowJob {
 
 impl WorkflowJob {
     fn evaluate_condition(&self, condition: &str) -> bool {
-        // For simplicity, we'll just check if an environment variable is set
-        // You can expand this to handle more complex conditions
-        let parts: Vec<&str> = condition.split('=').collect();
-        if parts.len() == 2 {
-            let key = parts[0].trim();
-            let value = parts[1].trim().trim_matches('"');
-            self.get_env(key).map_or(false, |v| v == value)
-        } else {
-            false
-        }
+        let app_ctx = self.context.read();
+        let env_hashmap = app_ctx.env.clone();
+        let template_context = context! {
+            env => env_hashmap,
+        };
+
+        let resolved = match Environment::new().render_str(condition, template_context) {
+            Ok(result) => result.trim().to_lowercase() == "true",
+            Err(e) => {
+                error!("Failed to evaluate condition: {}", e);
+                false
+            }
+        };
+        info!(condition, resolved, "Condition evaluated");
+        resolved
     }
 
     fn run_bash_external(&self, command: &str, working_dir: PathBuf) -> (String, bool) {
@@ -388,7 +404,6 @@ impl Clone for Box<dyn JobTrait> {
 
 type ScheduledJobs = Arc<RwLock<HashMap<String, Vec<Box<dyn JobTrait>>>>>;
 
-#[derive(Clone)]
 struct Scheduler {
     jobs: ScheduledJobs,
 }
@@ -400,29 +415,33 @@ impl Scheduler {
         }
     }
 
-    fn add(&self, namespace: &str, job: Box<dyn JobTrait>) {
-        let mut jobs = self.jobs.write();
-        let namespace_jobs = jobs.entry(namespace.to_string()).or_default();
+    fn add(&mut self, namespace: &str, job: Box<dyn JobTrait>) {
         let job_name = job
-            .clone()
             .downcast_ref_to_workflow_job()
             .unwrap()
             .config
             .name
             .clone();
+
+        let mut jobs = self.jobs.write();
+
+        let namespace_jobs = jobs.entry(namespace.to_string()).or_default();
+
         let job_index = namespace_jobs
             .iter()
             .position(|j| j.downcast_ref_to_workflow_job().unwrap().config.name == job_name);
 
         if let Some(index) = job_index {
-            namespace_jobs[index] = job.clone();
+            namespace_jobs[index] = job;
         } else {
-            namespace_jobs.push(job.clone());
+            namespace_jobs.push(job);
         }
 
-        info!(namespace = %namespace, job = %job.downcast_ref_to_workflow_job().unwrap().config.name, "Adding job");
+        info!(namespace = %namespace, job = %job_name, "Adding job");
     }
 
+    // TODO: allow removal via namespace wide changes
+    #[allow(dead_code)]
     fn remove(&self, namespace: &str, name: &str) {
         let mut jobs = self.jobs.write();
         if let Some(namespace_jobs) = jobs.get_mut(namespace) {
@@ -441,71 +460,75 @@ impl Scheduler {
         let mut jobs = self.jobs.write();
         for (namespace, namespace_jobs) in jobs.iter_mut() {
             debug!(namespace = %namespace, starting_jobs = namespace_jobs.len(), "Starting to check jobs");
+            // TODO: revisit logic and if we should even be using retain_mut
             namespace_jobs.retain_mut(|job| {
-            if let Some(workflow_job) = job.clone().downcast_ref_to_workflow_job() {
-                for s in &workflow_job.crons() {
-
-                    let s = if s == "now" {
-                        let now = Local::now();
-                        let in_near_future = now + chrono::Duration::seconds(1);
-                        time_to_cron(in_near_future)
-                    } else {
-                        s.to_string()
-                    };
-
-                    match CronSchedule::from_str(&s) {
-                        Ok(schedule) => {
+                if let Some(workflow_job) = job.clone().downcast_ref_to_workflow_job() {
+                    for s in &workflow_job.crons() {
+                        let s = if s == "now" {
                             let now = Local::now();
-                            let should_run = schedule.upcoming(Local).next().map_or(false, |t| {
-                                let time_diff = t - now;
-                                let num_seconds = time_diff.num_seconds();
-                                debug!(job = %workflow_job.config.name, seconds = num_seconds, "Seconds until next job");
-                                num_seconds <= 0
-                            });
-                            if should_run {
-                                match job.run(
-                                    RunEvent {
-                                        event: RunEventTypes::Schedule,
-                                        data: HashMap::new(),
-                                    },
-                                ) {
-                                    Ok(run_results) => {
-                                        info!(run_results = ?run_results, job = %workflow_job.config.name, "Job ran successfully");
-                                    }
-                                    Err(e) => {
-                                        error!(job = %workflow_job.config.name, error = %e, "Job failed");
-                                    }
-                            };
-                        }
-                        }
-                        Err(e) => {
-                            error!(job = %workflow_job.config.name, error = %e, "Invalid cron, removing job");
+                            let in_near_future = now + chrono::Duration::seconds(1);
+                            time_to_cron(in_near_future)
+                        } else {
+                            s.to_string()
+                        };
 
+                        match CronSchedule::from_str(&s) {
+                            Ok(schedule) => {
+                                let now = Local::now();
+                                let should_run = schedule.upcoming(Local).next().map_or(false, |t| {
+                                    let time_diff = t - now;
+                                    let num_seconds = time_diff.num_seconds();
+                                    debug!(job = %workflow_job.config.name, seconds = num_seconds, "Seconds until next job");
+                                    num_seconds <= 0
+                                });
+                                if should_run {
+                                    match job.run(RunEvent { event: RunEventTypes::Schedule,data: HashMap::new() }) {
+                                        Ok(run_results) => {
+                                            info!(run_results = ?run_results, job = %workflow_job.config.name, "Job ran successfully");
+                                        }
+                                        Err(e) => {
+                                            error!(job = %workflow_job.config.name, error = %e, "Job failed");
+                                        }
+                                    };
+                                }
+                            }
+                            Err(e) => {
+                                error!(job = %workflow_job.config.name, error = %e, "Invalid cron, removing job");
+                                return false; // remove the job from the list
+                            }
                         }
                     }
                 }
-                false
-            } else {
-                warn!("Non-workflow job, skipping");
-                true
-            }
-            // TODO: handle special case for "now", and remove if it was run
-        });
+                true // default to keeping the job 
+            });
             debug!(namespace = %namespace, remaining_jobs = namespace_jobs.len(), "Finished checking jobs");
         }
     }
 }
 
-fn run_forever(scheduler: Arc<Scheduler>) {
+fn run_forever(scheduler: Arc<Mutex<Scheduler>>) {
     tokio::spawn(async move {
         loop {
-            scheduler.run();
+            // lock the scheduler only for the duration of the run() call
+            // in the future, we may want to consider a lock-free data structure
+            {
+                match scheduler.lock() {
+                    Ok(scheduler) => {
+                        scheduler.run();
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to lock scheduler");
+                    }
+                }
+            } // lock is released here
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 }
 
-fn initialize() -> Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
+type AppData = (Arc<Mutex<Database>>, Arc<Mutex<Scheduler>>);
+
+fn initialize() -> Result<AppData> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -528,7 +551,7 @@ fn initialize() -> Result<(Arc<Mutex<Database>>, Arc<Scheduler>)> {
         Database::create(database_path).context("Failed to create database")?,
     ));
 
-    let scheduler: Arc<Scheduler> = Arc::new(Scheduler::new());
+    let scheduler = Arc::new(Mutex::new(Scheduler::new()));
 
     match hydrate_scheduler(&db, &scheduler) {
         Ok(()) => {}
@@ -549,7 +572,7 @@ fn daemonize() -> Result<()> {
     let stdout = File::create("/tmp/jikan.out")?;
     let stderr = File::create("/tmp/jikan.err")?;
 
-    // Attempt to set permissions, but don't fail if it doesn't work
+    // attempt to set permissions, but don't fail if it doesn't work
     let _ = std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o644));
 
     let daemonize = Daemonize::new()
@@ -562,14 +585,19 @@ fn daemonize() -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let run_in_background = args.get(1).map_or(false, |arg| arg == "daemon");
-    let should_stop = args.get(1).map_or(false, |arg| arg == "stop");
+    let matches = clap::Command::new("jikand")
+        .version("1.0")
+        .author("David Holtz (drbh)")
+        .about("The Jikan workflow engine daemon")
+        .subcommand(clap::Command::new("daemon").about("Run the daemon in the background"))
+        .subcommand(clap::Command::new("stop").about("Stop the running daemon"))
+        .get_matches();
+
     let daemon_info = DaemonInfo {
         started_at: Local::now(),
     };
 
-    if should_stop {
+    if matches.subcommand_matches("stop").is_some() {
         let pid_file = "/tmp/jikan.pid";
         let pid = std::fs::read_to_string(pid_file)
             .context("Failed to read PID file. Is the daemon running?")?
@@ -587,19 +615,19 @@ fn main() -> Result<()> {
 
     let (db, scheduler) = initialize()?;
 
-    if run_in_background {
+    if matches.subcommand_matches("daemon").is_some() {
         daemonize()?;
     }
 
     // Create and start the Tokio runtime
     let runtime = Runtime::new()?;
     // we defer to the tokio runtime to the bottom of the main function rather
-    // then with a macro to ensure that the daemonize function is called first
+    // than with a macro to ensure that the daemonize function is called first
     runtime.block_on(async { start_server_and_scheduler(db, scheduler, daemon_info).await })
 }
 
 #[instrument(skip(db, scheduler))]
-fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Scheduler>) -> Result<()> {
+fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Mutex<Scheduler>>) -> Result<()> {
     let db_guard = db.lock().unwrap();
     let read_txn = db_guard
         .begin_read()
@@ -627,6 +655,7 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Scheduler>) -> R
 
     let mut hydrated_jobs = 0;
 
+    let mut scheduler = scheduler.lock().unwrap();
     for result in table.iter().context("Failed to iterate over workflows")? {
         let (key, yaml_content) = result.context("Failed to read workflow entry")?;
         let (namespace, name) = key.value();
@@ -651,6 +680,8 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Scheduler>) -> R
             }
         }
     }
+    // drop the scheduler lock
+    drop(scheduler);
 
     info!(
         hydrated_jobs = hydrated_jobs,
@@ -662,7 +693,7 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Scheduler>) -> R
 #[instrument(skip(db, scheduler))]
 async fn start_server_and_scheduler(
     db: Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
+    scheduler: Arc<Mutex<Scheduler>>,
     daemon_info: DaemonInfo,
 ) -> Result<()> {
     // start the scheduler
@@ -678,7 +709,7 @@ async fn start_server_and_scheduler(
     info!(address = %addr, "Server started");
 
     {
-        // ensure the NAMEPACES table and WORKFLOWS table exist (write dummy data; key, value)
+        // ensure the NAMESPACES table and WORKFLOWS table exist (write dummy data; key, value)
         let db = db.lock().unwrap();
         let write_txn = db
             .begin_write()
@@ -734,31 +765,19 @@ async fn delete_namespace(
     Ok(format!("Namespace '{name}' deleted successfully.\n"))
 }
 
-#[instrument(skip(db))]
-async fn add_namespace(name: &str, path: &str, db: &Arc<Mutex<Database>>) -> Result<String> {
-    if path.starts_with('.') {
-        return Ok("Invalid directory path. Please provide an absolute path.".to_string());
-    }
-    let namespace = Namespace::new(name.to_string(), PathBuf::from(path));
-    let db = db.lock().unwrap();
-    let write_txn = db
-        .begin_write()
-        .context("Failed to begin write transaction")?;
-    {
-        let mut table = write_txn
-            .open_table(NAMESPACES)
-            .context("Failed to open namespaces table")?;
-        table
-            .insert(name, serde_json::to_string(&namespace).unwrap().as_str())
-            .context("Failed to insert namespace")?;
-    }
-    write_txn.commit().context("Failed to commit transaction")?;
+#[derive(Debug, Serialize)]
+struct ListNamespaceNamespaceResponse {
+    name: String,
+    count: usize,
+}
 
-    Ok(format!("Namespace '{name}' added successfully.\n"))
+#[derive(Debug, Serialize)]
+struct ListNamespaceResponse {
+    namespaces: Vec<ListNamespaceNamespaceResponse>,
 }
 
 #[instrument(skip(db))]
-async fn list_namespaces(db: &Arc<Mutex<Database>>) -> Result<String> {
+async fn list_namespaces(db: &Arc<Mutex<Database>>) -> Result<ListNamespaceResponse> {
     let db = db.lock().unwrap();
     let read_txn = db
         .begin_read()
@@ -767,21 +786,40 @@ async fn list_namespaces(db: &Arc<Mutex<Database>>) -> Result<String> {
         .open_table(NAMESPACES)
         .context("Failed to open namespaces table")?;
 
-    let mut response = String::from("Namespaces:\n");
+    let mut list_namespace_response = ListNamespaceResponse { namespaces: vec![] };
     for result in table.iter().context("Failed to iterate over namespaces")? {
         let (name, data) = result.context("Failed to read namespace entry")?;
         let namespace: Namespace =
             serde_json::from_str(data.value()).context("Failed to parse namespace data")?;
 
-        response.push_str(&format!(
-            "- {} (path: {})\n",
-            name.value(),
-            namespace.path.display()
-        ));
+        let namespace_path = namespace.path.clone();
+        let workspace_path = namespace_path.join(".jikan").join("workflows");
+
+        // TODO: add some notion of a namespace content sync status
+        // otherwise the database may be out of sync with the filesystem
+        let count = WalkDir::new(workspace_path.clone())
+            .follow_links(true)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .map_or(false, |ext| ext == "yaml" || ext == "yml")
+            })
+            .count();
+
+        list_namespace_response
+            .namespaces
+            .push(ListNamespaceNamespaceResponse {
+                name: name.value().to_string(),
+                count,
+            });
     }
 
     info!("Namespaces listed successfully");
-    Ok(response)
+    Ok(list_namespace_response)
 }
 
 #[instrument(skip(db, scheduler))]
@@ -790,7 +828,7 @@ async fn add_workflow(
     name: &str,
     yaml_content: &str,
     db: &Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
+    scheduler: Arc<Mutex<Scheduler>>,
 ) -> Result<String> {
     let config: WorkflowYaml =
         serde_yaml::from_str(yaml_content).context("Failed to parse workflow YAML")?;
@@ -825,11 +863,19 @@ async fn add_workflow(
     let namespace_obj: Namespace =
         serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace data")?;
 
-    scheduler.add(namespace, Box::new(WorkflowJob::new(config, namespace_obj)));
+    let mut scheduler = scheduler.lock().unwrap();
+    let workflow = WorkflowJob::new(config, namespace_obj);
+    scheduler.add(namespace, Box::new(workflow));
+    drop(scheduler);
 
     Ok(format!(
         "Workflow '{name}' added successfully to namespace '{namespace}'.\n",
     ))
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterWorkflowsFromDirResponse {
+    registered: usize,
 }
 
 #[instrument(skip(db, scheduler))]
@@ -837,8 +883,8 @@ async fn register_workflows_from_dir(
     namespace: &str,
     dir_path: &str,
     db: &Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
-) -> Result<String> {
+    scheduler: Arc<Mutex<Scheduler>>,
+) -> Result<RegisterWorkflowsFromDirResponse> {
     let mut registered = 0;
 
     let namespace_path = PathBuf::from(dir_path);
@@ -846,16 +892,16 @@ async fn register_workflows_from_dir(
 
     // ensure the directory exists
     if !workspace_path.exists() {
-        return Ok("Invalid directory path. Please provide an absolute path.".to_string());
+        return Err(anyhow::anyhow!(
+            "Directory not found: {}",
+            workspace_path.display()
+        ));
     }
 
-    println!(
-        "Registering workflows from directory: {}",
-        workspace_path.display()
-    );
-
     if workspace_path.is_relative() {
-        return Ok("Invalid directory path. Please provide an absolute path.".to_string());
+        return Err(anyhow::anyhow!(
+            "Invalid directory path. Please provide an absolute path."
+        ));
     }
 
     {
@@ -910,9 +956,13 @@ async fn register_workflows_from_dir(
         }
     }
 
-    Ok(format!(
-        "Registered {registered} workflows in namespace '{namespace}'.\n",
-    ))
+    let response = RegisterWorkflowsFromDirResponse { registered };
+    Ok(response)
+}
+
+#[derive(Debug, Serialize)]
+struct RunWorkflowResponse {
+    run_results: RunResults,
 }
 
 #[instrument(skip(db, scheduler))]
@@ -920,9 +970,9 @@ async fn run_workflow(
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
+    scheduler: Arc<Mutex<Scheduler>>,
     run_data_str: &str,
-) -> Result<String> {
+) -> Result<RunWorkflowResponse> {
     // first, check if the workflow exists in the database
     let db = db.lock().unwrap();
     let read_txn = db
@@ -944,12 +994,15 @@ async fn run_workflow(
         })
         .collect();
 
-    if let Some(workflow) = table
+    if let Some(_workflow) = table
         .get((namespace, name))
         .context("Failed to get workflow")?
     {
         // workflow exists in the database, now check the scheduler
-        let jobs = scheduler.jobs.read();
+        let jobs = scheduler.lock().unwrap();
+
+        let jobs = jobs.jobs.read();
+
         if let Some(namespace_jobs) = jobs.get(namespace) {
             if let Some(job) = namespace_jobs.iter().find(|j| {
                 j.downcast_ref_to_workflow_job()
@@ -970,61 +1023,25 @@ async fn run_workflow(
                             run_results = ?run_results,
                             "Workflow ran successfully"
                         );
-                        Ok(format!(
-                            "Workflow '{name}' in namespace '{namespace}' ran successfully.\nRun results: {run_results:?}\n",
-                        ))
+                        let response = RunWorkflowResponse { run_results };
+                        Ok(response)
                     }
                     Err(e) => {
                         error!(namespace = namespace, workflow = name, error = %e, "Workflow failed to run");
-                        Ok(format!(
+                        Err(anyhow::anyhow!(
                             "Workflow '{name}' in namespace '{namespace}' failed to run: {e}\n"
                         ))
                     }
                 }
             } else {
-                // workflow exists in the database but not in the scheduler, add it
-                drop(jobs); // release the read lock before modifying the scheduler
-                let config: WorkflowYaml = serde_yaml::from_str(workflow.value())
-                    .context("Failed to parse workflow YAML")?;
-
-                let namespace_table = read_txn
-                    .open_table(NAMESPACES)
-                    .context("Failed to open namespaces table")?;
-
-                let namespace_entry = namespace_table
-                    .get(namespace)
-                    .context("Failed to get namespace")?
-                    .ok_or_else(|| anyhow::anyhow!("Namespace not found: {}", namespace))?;
-
-                let namespace_obj: Namespace = serde_json::from_str(namespace_entry.value())
-                    .context("Failed to parse namespace data")?;
-
-                let mut new_job = Box::new(WorkflowJob::new(config, namespace_obj));
-                scheduler.add(namespace, new_job.clone());
-
-                // Now run the newly added job
-                match new_job.run(RunEvent {
-                    event: RunEventTypes::Manual,
-                    data: HashMap::new(),
-                }) {
-                    Ok(run_results) => {
-                        info!(
-                            namespace = namespace,
-                            workflow = name,
-                            run_results = ?run_results,
-                            "Workflow ran successfully after being added to scheduler"
-                        );
-                        Ok(format!(
-                            "Workflow '{name}' in namespace '{namespace}' was added to the scheduler and ran successfully.\nRun results: {run_results:?}\n",
-                        ))
-                    }
-                    Err(e) => {
-                        error!(namespace = namespace, workflow = name, error = %e, "Workflow failed to run after being added to scheduler");
-                        Ok(format!(
-                            "Workflow '{name}' in namespace '{namespace}' was added to the scheduler but failed to run: {e}\n"
-                        ))
-                    }
-                }
+                warn!(
+                    namespace = namespace,
+                    workflow = name,
+                    "Workflow not found in scheduler"
+                );
+                Err(anyhow::anyhow!(
+                    "Workflow '{name}' not found in namespace '{namespace}'.\n"
+                ))
             }
         } else {
             warn!(
@@ -1032,8 +1049,8 @@ async fn run_workflow(
                 workflow = name,
                 "Namespace not found in scheduler"
             );
-            Ok(format!(
-                "Namespace '{namespace}' not found in the scheduler. Unable to run workflow '{name}'.\n",
+            Err(anyhow::anyhow!(
+                "Namespace '{namespace}' not found in the scheduler. Unable to run workflow '{name}'.\n"
             ))
         }
     } else {
@@ -1042,14 +1059,26 @@ async fn run_workflow(
             workflow = name,
             "Workflow not found in database"
         );
-        Ok(format!(
-            "Workflow '{name}' not found in namespace '{namespace}'.\n",
+        Err(anyhow::anyhow!(
+            "Workflow '{name}' not found in namespace '{namespace}'.\n"
         ))
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ListWorkflowsResponse {
+    namespace: String,
+    name: String,
+    status: String,
+    crons: Vec<String>,
+    next_runs: Vec<String>,
+}
+
 #[instrument(skip(db))]
-async fn list_workflows(namespace: Option<&str>, db: &Arc<Mutex<Database>>) -> Result<String> {
+async fn list_workflows(
+    namespace: Option<&str>,
+    db: &Arc<Mutex<Database>>,
+) -> Result<Vec<ListWorkflowsResponse>> {
     let db = db.lock().unwrap();
     let read_txn = db
         .begin_read()
@@ -1058,23 +1087,58 @@ async fn list_workflows(namespace: Option<&str>, db: &Arc<Mutex<Database>>) -> R
         .open_table(WORKFLOWS)
         .context("Failed to open workflows table")?;
 
-    let mut response = String::from("Workflows:\n");
-    for result in table.iter().context("Failed to iterate over workflows")? {
-        let (key, _value) = result.context("Failed to read workflow entry")?;
+    let mut response = Vec::new();
 
+    for result in table.iter().context("Failed to iterate over workflows")? {
+        let (key, workflow) = result.context("Failed to read workflow entry")?;
         let (ns, name) = key.value();
+        let wk = serde_yaml::from_str::<WorkflowYaml>(workflow.value())
+            .context("Failed to parse workflow YAML")?;
+
+        let empty_namespace = Namespace::new(String::new(), PathBuf::new());
+        let workflow = WorkflowJob::new(wk, empty_namespace);
+        let crons = workflow.crons();
 
         if namespace.is_none() || namespace == Some(ns) {
-            response.push_str(&format!("- {name} (namespace: {ns})\n"));
+            let next_runs = get_next_runs(crons.clone(), ns, name, 2)
+                .iter()
+                .map(|(cron_str, next_run, num_seconds)| {
+                    format!(
+                        "{} {} (in {} seconds)",
+                        cron_str,
+                        next_run.format("%Y-%m-%d %H:%M:%S"),
+                        num_seconds
+                    )
+                })
+                .collect();
+            response.push(ListWorkflowsResponse {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                status: "running".to_string(),
+                crons,
+                next_runs,
+            });
         }
     }
 
     info!("Workflows listed successfully");
+
     Ok(response)
 }
 
+#[derive(Debug, Serialize)]
+struct GetWorkflowResponse {
+    namespace: String,
+    name: String,
+    yaml: String,
+}
+
 #[instrument(skip(db))]
-async fn get_workflow(namespace: &str, name: &str, db: &Arc<Mutex<Database>>) -> Result<String> {
+async fn get_workflow(
+    namespace: &str,
+    name: &str,
+    db: &Arc<Mutex<Database>>,
+) -> Result<GetWorkflowResponse> {
     let db = db.lock().unwrap();
     let read_txn = db
         .begin_read()
@@ -1092,13 +1156,15 @@ async fn get_workflow(namespace: &str, name: &str, db: &Arc<Mutex<Database>>) ->
             workflow = name,
             "Workflow retrieved successfully"
         );
-        Ok(format!(
-            "Workflow '{name}' in namespace '{namespace}':\n{}",
-            workflow.value()
-        ))
+        let response = GetWorkflowResponse {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            yaml: workflow.value().to_string(),
+        };
+        Ok(response)
     } else {
         warn!(namespace = namespace, workflow = name, "Workflow not found");
-        Ok(format!(
+        Err(anyhow::anyhow!(
             "Workflow '{name}' not found in namespace '{namespace}'.\n"
         ))
     }
@@ -1124,9 +1190,7 @@ async fn delete_workflow(
             .context("Failed to remove workflow")?;
     }
     write_txn.commit().context("Failed to commit transaction")?;
-
     scheduler.remove(namespace, name);
-
     info!(
         namespace = namespace,
         workflow = name,
@@ -1137,12 +1201,52 @@ async fn delete_workflow(
     ))
 }
 
+fn get_next_runs(
+    crons: Vec<String>,
+    namespace: &str,
+    name: &str,
+    n: usize,
+) -> Vec<(String, DateTime<Local>, i64)> {
+    let mut next_runs = Vec::new();
+    let now = Local::now();
+
+    for cron in crons {
+        let s = if cron == "now" {
+            let in_near_future = now + chrono::Duration::seconds(1);
+            time_to_cron(in_near_future)
+        } else {
+            cron.to_string()
+        };
+
+        match CronSchedule::from_str(&s.clone()) {
+            Ok(schedule) => {
+                for next_time in schedule.upcoming(Local).take(n) {
+                    let time_diff = next_time - now;
+                    let num_seconds = time_diff.num_seconds();
+                    next_runs.push((s.clone(), next_time, num_seconds));
+                }
+            }
+            Err(e) => {
+                error!(error = %e, namespace = namespace, workflow = name, cron = %s, "Invalid cron expression");
+            }
+        }
+    }
+    next_runs
+}
+
+#[derive(Debug, Serialize)]
+struct GetNextRunResponse {
+    namespace: String,
+    name: String,
+    next_runs: Vec<String>,
+}
+
 #[instrument]
 async fn get_next_run_workflow(
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
-) -> Result<String> {
+) -> Result<GetNextRunResponse> {
     let db = db.lock().unwrap();
     let read_txn = db
         .begin_read()
@@ -1173,30 +1277,7 @@ async fn get_next_run_workflow(
         let job = WorkflowJob::new(config, namespace_obj);
         let crons = job.crons();
 
-        let mut next_runs = Vec::new();
-        let now = Local::now();
-
-        for cron in crons {
-            let s = if cron == "now" {
-                let in_near_future = now + chrono::Duration::seconds(1);
-                time_to_cron(in_near_future)
-            } else {
-                cron.to_string()
-            };
-
-            match CronSchedule::from_str(&s) {
-                Ok(schedule) => {
-                    if let Some(next_time) = schedule.upcoming(Local).next() {
-                        let time_diff = next_time - now;
-                        let num_seconds = time_diff.num_seconds();
-                        next_runs.push((next_time, num_seconds));
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, namespace = namespace, workflow = name, cron = %s, "Invalid cron expression");
-                }
-            }
-        }
+        let mut next_runs = get_next_runs(crons, namespace, name, 1);
 
         if next_runs.is_empty() {
             info!(
@@ -1204,15 +1285,22 @@ async fn get_next_run_workflow(
                 workflow = name,
                 "No valid cron expressions found"
             );
-            Ok(format!(
-                "Workflow '{name}' in namespace '{namespace}' has no valid cron expressions.\n"
-            ))
+            Ok(GetNextRunResponse {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                next_runs: vec!["No valid cron expressions found".to_string()],
+            })
         } else {
-            next_runs.sort_by_key(|&(_, seconds)| seconds);
-            let mut response = format!("Workflow '{name}' in namespace '{namespace}' next runs:\n");
-            for (next_time, seconds) in next_runs.clone() {
-                response.push_str(&format!(
-                    "In {} seconds ({})\n",
+            next_runs.sort_by_key(|&(_, _, seconds)| seconds);
+            let mut response = GetNextRunResponse {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                next_runs: vec![],
+            };
+            for (cron_str, next_time, seconds) in next_runs.clone() {
+                response.next_runs.push(format!(
+                    "{} In {} seconds ({})",
+                    cron_str,
                     seconds,
                     next_time.to_rfc2822()
                 ));
@@ -1228,19 +1316,32 @@ async fn get_next_run_workflow(
         }
     } else {
         warn!(namespace = namespace, workflow = name, "Workflow not found");
-        Ok(format!(
+        Err(anyhow::anyhow!(
             "Workflow '{name}' not found in namespace '{namespace}'.\n"
         ))
     }
 }
 
-// get_last_run_workflow also points to the logs from the last run
+#[derive(Debug, Serialize)]
+struct LogFileResponse {
+    file_name: String,
+    tail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LastRunResponse {
+    namespace: String,
+    name: String,
+    last_run: String,
+    logs: Vec<LogFileResponse>,
+}
+
 #[instrument]
 async fn get_last_run_workflow(
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
-) -> Result<String> {
+) -> Result<LastRunResponse> {
     let db = db.lock().unwrap();
     let read_txn = db
         .begin_read()
@@ -1268,8 +1369,45 @@ async fn get_last_run_workflow(
         let namespace_obj: Namespace =
             serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace")?;
 
-        let _job = WorkflowJob::new(config, namespace_obj);
-        let last_run = "someid";
+        let _job = WorkflowJob::new(config, namespace_obj.clone());
+
+        // get the logs from the last run using the directory path
+        let logs_path = namespace_obj.path.join(".jikan").join("logs");
+
+        // get a list of all of the directories in the last run directory
+        let logs = std::fs::read_dir(logs_path.clone()).unwrap();
+        let mut last_run = String::new();
+
+        for log in logs {
+            let log = log.unwrap();
+            let name = log.file_name().into_string().unwrap();
+            if name > last_run {
+                last_run = name;
+            }
+        }
+
+        // tail the all of the log files in the directory
+        let logs = std::fs::read_dir(logs_path.join(last_run.clone())).unwrap();
+        let mut logs_vec = Vec::new();
+        for log in logs {
+            let log = log.unwrap();
+            let log_path = log.path();
+            let log_content = std::fs::read_to_string(log_path).unwrap();
+
+            let resp = LogFileResponse {
+                file_name: log.file_name().into_string().unwrap(),
+                tail: log_content,
+            };
+
+            logs_vec.push(resp);
+        }
+
+        let response = LastRunResponse {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            last_run: last_run.clone(),
+            logs: logs_vec,
+        };
 
         info!(
             namespace = namespace,
@@ -1277,15 +1415,19 @@ async fn get_last_run_workflow(
             last_run = last_run,
             "Last run retrieved"
         );
-        Ok(format!(
-            "Workflow '{name}' in namespace '{namespace}' last ran at {last_run}.\n",
-        ))
+
+        Ok(response)
     } else {
         warn!(namespace = namespace, workflow = name, "Workflow not found");
-        Ok(format!(
-            "Workflow '{name}' not found in namespace '{namespace}'.\n",
+        Err(anyhow::anyhow!(
+            "Workflow '{name}' not found in namespace '{namespace}'.\n"
         ))
     }
+}
+
+#[derive(Debug, Serialize)]
+struct SetEnvResponse {
+    message: String,
 }
 
 fn set_env(
@@ -1294,9 +1436,11 @@ fn set_env(
     key: &str,
     value: &str,
     _db: &Arc<Mutex<Database>>,
-    scheduler: &Arc<Scheduler>,
-) -> String {
-    let jobs = scheduler.jobs.read();
+    scheduler: &Arc<Mutex<Scheduler>>,
+) -> Result<SetEnvResponse> {
+    let jobs = scheduler.lock().unwrap();
+    let jobs = jobs.jobs.write();
+
     if let Some(namespace_jobs) = jobs.get(namespace) {
         if let Some(job) = namespace_jobs.iter().find(|j| {
             j.downcast_ref_to_workflow_job()
@@ -1304,18 +1448,30 @@ fn set_env(
         }) {
             if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
                 workflow_job.set_env(key.to_string(), value.to_string());
-                format!(
-                    "Environment variable '{key}' set for workflow '{name}' in namespace '{namespace}'.\n",
-                )
+                Ok(SetEnvResponse {
+                    message: format!(
+                        "Environment variable '{key}' set to '{value}' for workflow '{name}' in namespace '{namespace}'.\n",
+                    ),
+                })
             } else {
-                format!("Workflow '{name}' in namespace '{namespace}' is not a WorkflowJob.\n",)
+                Err(anyhow::anyhow!(
+                    "Workflow '{name}' in namespace '{namespace}' is not a WorkflowJob.\n"
+                ))
             }
         } else {
-            format!("Workflow '{name}' not found in namespace '{namespace}'.\n",)
+            Err(anyhow::anyhow!(
+                "Workflow '{name}' not found in namespace '{namespace}'.\n"
+            ))
         }
     } else {
-        format!("Namespace '{namespace}' not found.\n",)
+        Err(anyhow::anyhow!("Namespace '{namespace}' not found.\n"))
     }
+}
+
+#[derive(Debug, Serialize)]
+struct GetEnvResponse {
+    key: String,
+    value: String,
 }
 
 fn get_env(
@@ -1323,38 +1479,49 @@ fn get_env(
     name: &str,
     key: &str,
     _db: &Arc<Mutex<Database>>,
-    scheduler: &Arc<Scheduler>,
-) -> String {
-    let jobs = scheduler.jobs.read();
+    scheduler: &Arc<Mutex<Scheduler>>,
+) -> Result<GetEnvResponse> {
+    let jobs = scheduler.lock().unwrap();
+    let jobs = jobs.jobs.read();
     if let Some(namespace_jobs) = jobs.get(namespace) {
         if let Some(job) = namespace_jobs.iter().find(|j| {
             j.downcast_ref_to_workflow_job()
                 .map_or(false, |wj| wj.config.name == name)
         }) {
             if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
-                if let Some(value) = workflow_job.get_env(key) {
-                    format!("{key}={value}\n")
-                } else {
-                    format!("Environment variable '{key}' not found for workflow '{name}' in namespace '{namespace}'.\n")
-                }
+                Ok(GetEnvResponse {
+                    key: key.to_string(),
+                    value: workflow_job.get_env(key).unwrap_or_default(),
+                })
             } else {
-                format!("Workflow '{name}' in namespace '{namespace}' is not a WorkflowJob.\n")
+                Err(anyhow::anyhow!(
+                    "Workflow '{name}' in namespace '{namespace}' is not a WorkflowJob.\n"
+                ))
             }
         } else {
-            format!("Workflow '{name}' not found in namespace '{namespace}'.\n")
+            Err(anyhow::anyhow!(
+                "Workflow '{name}' not found in namespace '{namespace}'.\n"
+            ))
         }
     } else {
-        format!("Namespace '{namespace}' not found.\n")
+        Err(anyhow::anyhow!("Namespace '{namespace}' not found.\n"))
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ListEnvResponse {
+    key: String,
+    value: String,
 }
 
 fn list_env(
     namespace: &str,
     name: &str,
     _db: &Arc<Mutex<Database>>,
-    scheduler: &Arc<Scheduler>,
-) -> String {
-    let jobs = scheduler.jobs.read();
+    scheduler: &Arc<Mutex<Scheduler>>,
+) -> Result<Vec<ListEnvResponse>> {
+    let jobs = scheduler.lock().unwrap();
+    let jobs = jobs.jobs.read();
     if let Some(namespace_jobs) = jobs.get(namespace) {
         if let Some(job) = namespace_jobs.iter().find(|j| {
             j.downcast_ref_to_workflow_job()
@@ -1362,45 +1529,59 @@ fn list_env(
         }) {
             if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
                 let env_vars = workflow_job.list_env();
-                let mut response = format!(
-                    "Environment variables for workflow '{name}' in namespace '{namespace}':\n"
-                );
+                let mut response = Vec::new();
                 for (key, value) in env_vars {
-                    response.push_str(&format!("{key}={value}\n"));
+                    response.push(ListEnvResponse { key, value });
                 }
-                response
+                Ok(response)
             } else {
-                format!("Workflow '{name}' in namespace '{namespace}' is not a W©orkflowJob.\n")
+                Err(anyhow::anyhow!(
+                    "Workflow '{name}' in namespace '{namespace}' is not a WorkflowJob.\n"
+                ))
             }
         } else {
-            format!("Workflow '{name}' not found in namespace '{namespace}'.\n")
+            Err(anyhow::anyhow!(
+                "Workflow '{name}' not found in namespace '{namespace}'.\n"
+            ))
         }
     } else {
-        format!("Namespace '{namespace}' not found.\n")
+        Err(anyhow::anyhow!("Namespace '{namespace}' not found.\n"))
     }
 }
 
-// get_daemon_info
+#[derive(Debug, Serialize)]
+struct DaemonInfoResponse {
+    started_at: String,
+    uptime: String,
+    version: String,
+}
+
 #[instrument]
-async fn get_daemon_info(daemon_info: DaemonInfo) -> Result<String> {
+async fn get_daemon_info(daemon_info: DaemonInfo) -> Result<DaemonInfoResponse> {
     let version = env!("CARGO_PKG_VERSION");
-    Ok(format!(
-        "Jikan Workflow Engine v{version}\n\
-        Started at: {started_at}\n\
-        Uptime: {uptime}\n",
-        version = version,
-        started_at = daemon_info.started_at.to_rfc2822(),
-        uptime = Local::now()
-            .signed_duration_since(daemon_info.started_at)
-            .num_seconds()
-    ))
+    let response = DaemonInfoResponse {
+        started_at: daemon_info.started_at.to_rfc2822(),
+        uptime: format!(
+            "{}",
+            Local::now()
+                .signed_duration_since(daemon_info.started_at)
+                .num_seconds()
+        ),
+        version: version.to_string(),
+    };
+
+    Ok(response)
+}
+
+fn serialize_response<T: Serialize>(response: T) -> Result<String> {
+    serde_json::to_string(&response).context("Failed to serialize response")
 }
 
 #[instrument(skip(stream, db, scheduler), fields(client_addr = %stream.peer_addr().unwrap()))]
 async fn handle_client(
     stream: TcpStream,
     db: Arc<Mutex<Database>>,
-    scheduler: Arc<Scheduler>,
+    scheduler: Arc<Mutex<Scheduler>>,
     daemon_info: DaemonInfo,
 ) -> Result<()> {
     let mut stream = TokioTcpStream::from_std(stream)?;
@@ -1412,42 +1593,30 @@ async fn handle_client(
     debug!(command = %line.trim(), "Received command");
 
     let response = match line.split_whitespace().collect::<Vec<&str>>().as_slice() {
-        // DAEMON
-        ["DAEMON_INFO"] => get_daemon_info(daemon_info).await?,
-
-        // NAMESPACE MANAGEMENT
-        ["ADD_NAMESPACE", name, path] => add_namespace(name, path, &db).await?,
-        ["DELETE_NAMESPACE", name] => delete_namespace(name, &db, scheduler).await?,
-        ["LIST_NAMESPACES"] => list_namespaces(&db).await?,
+        ["DAEMON_INFO"] => serialize_response(get_daemon_info(daemon_info).await?)?,
+        ["LIST_NAMESPACES"] => serialize_response(list_namespaces(&db).await?)?,
         ["REGISTER_DIR", namespace, dir_path] => {
-            register_workflows_from_dir(namespace, dir_path, &db, scheduler).await?
+            serialize_response(register_workflows_from_dir(namespace, dir_path, &db, scheduler).await?)?
         }
-
-        // FUTURE AND PAST
-        ["NEXT", namespace, name] => get_next_run_workflow(namespace, name, &db).await?,
-        ["LAST", namespace, name] => get_last_run_workflow(namespace, name, &db).await?,
-
-        // WORKFLOW MANAGEMENT
-        ["ADD", namespace, name, body] => {
-            add_workflow(namespace, name, body, &db, scheduler).await?
-        }
-        ["LIST", namespace] => list_workflows(Some(namespace), &db).await?,
-        ["GET", namespace, name] => get_workflow(namespace, name, &db).await?,
-        ["DELETE", namespace, name] => delete_workflow(namespace, name, &db, scheduler).await?,
-        ["RUN", namespace, name] => run_workflow(namespace, name, &db, scheduler, "").await?,
+        ["NEXT", namespace, name] => serialize_response(get_next_run_workflow(namespace, name, &db).await?)?,
+        ["LAST", namespace, name] => serialize_response(get_last_run_workflow(namespace, name, &db).await?)?,
+        ["LIST"] => serialize_response(list_workflows(None, &db).await?)?,
+        ["LIST", namespace] => serialize_response(list_workflows(Some(namespace), &db).await?)?,
+        ["GET", namespace, name] => serialize_response(get_workflow(namespace, name, &db).await?)?,
+        ["RUN", namespace, name] => serialize_response(run_workflow(namespace, name, &db, scheduler, "").await?)?,
         ["RUN", namespace, name, run_data] => {
-            run_workflow(namespace, name, &db, scheduler, run_data).await?
+            serialize_response(run_workflow(namespace, name, &db, scheduler, run_data).await?)?
         }
         ["SET_ENV", namespace, name, key, value] => {
-            set_env(namespace, name, key, value, &db, &scheduler)
+            serialize_response(set_env(namespace, name, key, value, &db, &scheduler)?)?
         }
-        ["GET_ENV", namespace, name, key] => get_env(namespace, name, key, &db, &scheduler),
-        ["LIST_ENV", namespace, name] => list_env(namespace, name, &db, &scheduler),
+        ["GET_ENV", namespace, name, key] => serialize_response(get_env(namespace, name, key, &db, &scheduler)?)?,
+        ["LIST_ENV", namespace, name] => serialize_response(list_env(namespace, name, &db, &scheduler)?)?,
         _ => {
             warn!(command = %line.trim(), "Invalid command received");
             "Invalid command. Use ADD_NAMESPACE, LIST_NAMESPACES, REGISTER_DIR, ADD, LIST, GET, or DELETE.\n".to_string()
         }
-    };
+    }.to_string();
 
     writer.write_all(response.as_bytes()).await?;
     writer.flush().await?;

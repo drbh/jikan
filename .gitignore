@@ -1,6 +1,7 @@
 .bak
 /target
 jikan.redb
+**.venv
 **/.jikan/logs/*
 
 workflows/*.yaml

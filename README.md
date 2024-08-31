@@ -32,11 +32,11 @@ cargo install --git https://github.com/drbh/jikan.git jk
 2. Start the Jikan daemon:
 
 ```bash
-jikan
+jikand
 # or run in the background
-jikan daemon
+jikand daemon
 # and to stop the daemon
-jikan stop
+jikand stop
 ```
 
 3. Create a simple workflow file (e.g., `.jikan/workflows/hello-world.yaml`):
@@ -143,7 +143,7 @@ name: my-workflow
 run-name: some-run-name
 on:
   schedule:
-    - cron: "0 0 * * * * *" # Run daily at midnight
+    - cron: "0 0 0 * * * *" # Run daily at midnight
 
 jobs:
   example-job:
@@ -163,12 +163,6 @@ Learn more about syntax and how it compares to Github Actions in [SYNTAX.md](SYN
 
 ### Workflow Management
 
-- Add a workflow:
-
-```bash
-jk add [namespace] [name] [body]
-```
-
 - List workflows:
 
 ```bash
@@ -181,36 +175,16 @@ jk list [namespace]
 jk get [namespace] [name]
 ```
 
-- Delete a workflow:
-
-```bash
-jk delete [namespace] [name]
-```
-
 - Run a workflow:
 
 ```bash
 jk run [namespace] [name]
 ```
 
-### Namespace Management
-
-- Add a namespace:
-
-```bash
-jk add_namespace [name] [path]
-```
-
 - List namespaces:
 
 ```bash
 jk list_namespaces
-```
-
-- Delete a namespace:
-
-```bash
-jk delete_namespace [name]
 ```
 
 ### Environment Variables
@@ -233,18 +207,16 @@ jk get_env [namespace] [name] [key]
 jk list_env [namespace] [name]
 ```
 
-## Advanced Usage
-
-- Registering directory-based workflows:
-
-```bash
-jk register_dir [namespace] [dir_path]
-```
-
 - Checking the next scheduled run:
 
 ```bash
 jk next [namespace] [name]
+```
+
+- View last Run:
+
+```bash
+jk last [namespace] [name]
 ```
 
 ## Troubleshooting
