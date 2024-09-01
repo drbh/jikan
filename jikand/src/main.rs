@@ -65,6 +65,33 @@ impl Namespace {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ActionYaml {
+    name: String,
+    description: String,
+    inputs: HashMap<String, Input>,
+    outputs: HashMap<String, Output>,
+    runs: Runs,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Input {
+    description: String,
+    required: bool,
+    default: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Output {
+    description: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Runs {
+    using: String,
+    main: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WorkflowYaml {
     name: String,
     #[serde(rename = "run-name")]
@@ -105,8 +132,10 @@ struct Job {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 enum RunOnBackend {
+    // NodeExternal(Option<String>),
     PythonExternal(Option<String>),
     Bash,
+    Machine, // conceptually above the shell level
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -114,6 +143,7 @@ struct Step {
     run: Option<String>,
     name: Option<String>,
     uses: Option<String>,
+    with: Option<HashMap<String, String>>,
 }
 
 trait JobTrait: Send + Sync {
@@ -160,30 +190,46 @@ impl Context {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MachineConfig {
+    operating_system: String,
+    executable_path: String,
+    username: String,
+    run_binary_map: HashMap<String, String>,
+}
+
 #[derive(Clone, Debug)]
 struct WorkflowJob {
     config: WorkflowYaml,
+    machine_config: MachineConfig,
     context: Arc<RwLock<Context>>,
     namespace: Namespace,
 }
 
 impl WorkflowJob {
-    fn new(config: WorkflowYaml, namespace: Namespace) -> Self {
+    fn new(config: WorkflowYaml, machine_config: MachineConfig, namespace: Namespace) -> Self {
         Self {
             config,
+            machine_config,
             context: Arc::new(RwLock::new(Context::new())),
             namespace,
         }
     }
 
-    fn set_env(&self, key: String, value: String) {
+    fn set_env<T>(&self, key: T, value: T)
+    where
+        T: Into<String>, // any type that can be converted to a string
+    {
         let mut context = self.context.write();
-        context.set_env(key, value);
+        context.set_env(key.into(), value.into());
     }
 
-    fn get_env(&self, key: &str) -> Option<String> {
+    fn get_env<T>(&self, key: T) -> Option<String>
+    where
+        T: Into<String>,
+    {
         let context = self.context.read();
-        context.get_env(key).cloned()
+        context.get_env(&key.into()).cloned()
     }
 
     fn list_env(&self) -> Vec<(String, String)> {
@@ -204,7 +250,6 @@ impl JobTrait for WorkflowJob {
 
     #[instrument(skip(self), fields(workflow_name = %self.config.name))]
     fn run(&mut self, event: RunEvent) -> Result<RunResults, String> {
-        println!("Running workflow");
         let job_id = Local::now().format("%Y%m%d%H%M%S").to_string();
 
         let mut logfiles = vec![];
@@ -218,7 +263,7 @@ impl JobTrait for WorkflowJob {
             Some(env) => {
                 for (key, value) in env {
                     info!(key = %key, value = %value, "Setting environment variable");
-                    self.set_env(key.clone(), value.clone());
+                    self.set_env(key, value);
                 }
             }
             None => {}
@@ -238,7 +283,7 @@ impl JobTrait for WorkflowJob {
             match &job.env {
                 Some(env) => {
                     for (key, value) in env {
-                        self.set_env(key.clone(), value.clone());
+                        self.set_env(key, value);
                     }
                 }
                 None => {}
@@ -262,7 +307,9 @@ impl JobTrait for WorkflowJob {
                     };
 
                     let (logs, succeeded) = match &job.runs_on {
-                        RunOnBackend::Bash => self.run_bash_external(&run, working_dir.clone()),
+                        RunOnBackend::Bash | RunOnBackend::Machine => {
+                            self.run_bash_external(&run, working_dir.clone())
+                        }
                         RunOnBackend::PythonExternal(binary_path) => {
                             self.run_python_external(binary_path, &run, working_dir.clone())
                         }
@@ -277,7 +324,83 @@ impl JobTrait for WorkflowJob {
 
                 if let Some(uses) = &step.uses {
                     info!(step = index, uses = uses, "Using action");
-                    // handle the TODO:'uses' directive
+                    let action_repo_name = uses.split('/').last().unwrap().to_string();
+                    let action_dir = working_dir.join("actions").join(action_repo_name);
+                    let action_yaml_path = action_dir.join("action.yaml");
+                    let action_yaml = std::fs::read_to_string(action_yaml_path).unwrap();
+                    let action_yaml: ActionYaml = serde_yaml::from_str(&action_yaml).unwrap();
+
+                    // add all the inputs to the context as INPUT_
+                    for (input_name, input) in &action_yaml.inputs {
+                        // prefer the `with` value over the default value but use the default value if it exists
+                        let input_value = match step.with {
+                            Some(ref with) => with.get(input_name).cloned(),
+                            None => None,
+                        }
+                        .unwrap_or_else(|| input.default.clone().unwrap_or_else(String::new));
+
+                        let input_name =
+                            format!("INPUT_{}", input_name.to_uppercase().replace('-', "_"));
+
+                        info!(input_name = %input_name, input_value = %input_value, "Setting input");
+                        self.set_env(&input_name, &input_value);
+                    }
+
+                    // get action_entry_point from the action yaml
+                    let action_entry_point = action_yaml.runs.main.clone();
+
+                    // now run node index.js in the action directory
+                    let action_run = action_dir.join(action_entry_point);
+
+                    // try to find the binary path for the action in rhe run_binary_map
+                    let action_bin_path = self
+                        .machine_config
+                        .run_binary_map
+                        .iter()
+                        .find(|(key, _)| *key == &action_yaml.runs.using)
+                        .map(|(_, value)| value);
+
+                    if action_bin_path.is_none() {
+                        error!("Binary not found for action");
+                        continue;
+                    }
+
+                    let action_bin_path = action_bin_path.unwrap();
+
+                    // set GITHUB_EVENT_PAYLOAD to a JSON string of the event data
+                    let event_payload = serde_json::to_string(&event).unwrap();
+                    self.set_env("GITHUB_EVENT_PAYLOAD", &event_payload);
+
+                    let (logs, _succeeded) = self.run_bash_external(
+                        &format!("{} {}", action_bin_path.clone(), action_run.display()),
+                        working_dir.clone(),
+                    );
+                    let mut filtered_logs = String::new();
+
+                    for line in logs.lines() {
+                        if line.contains("::set-output") {
+                            // remove the "::set-output " prefix and split on "="
+                            let parts: Vec<&str> = line
+                                .trim_start_matches("::set-output ")
+                                .split('=')
+                                .collect();
+                            let key = parts[0];
+                            let value = parts[1];
+
+                            // ensure the output is listed in the action yaml
+                            if action_yaml.outputs.contains_key(key) {
+                                self.set_env(key, value);
+                            } else {
+                                warn!(key, value, "Output not defined in action yaml");
+                            }
+                        } else {
+                            filtered_logs.push_str(line);
+                            filtered_logs.push('\n');
+                        }
+                    }
+
+                    // add filtered logs to the job logs
+                    job_logs.push_str(&filtered_logs);
                 }
             }
 
@@ -528,7 +651,7 @@ fn run_forever(scheduler: Arc<Mutex<Scheduler>>) {
 
 type AppData = (Arc<Mutex<Database>>, Arc<Mutex<Scheduler>>);
 
-fn initialize() -> Result<AppData> {
+fn initialize(machine_config: MachineConfig) -> Result<AppData> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -553,7 +676,7 @@ fn initialize() -> Result<AppData> {
 
     let scheduler = Arc::new(Mutex::new(Scheduler::new()));
 
-    match hydrate_scheduler(&db, &scheduler) {
+    match hydrate_scheduler(machine_config, &db, &scheduler) {
         Ok(()) => {}
         Err(e) => {
             warn!(error = %e, "Failed to hydrate scheduler");
@@ -593,6 +716,63 @@ fn main() -> Result<()> {
         .subcommand(clap::Command::new("stop").about("Stop the running daemon"))
         .get_matches();
 
+    // get native node binary path
+    let node_binding = Command::new("which")
+        .arg("node")
+        .output()
+        .context("Failed to run which")?;
+
+    let node_binary = std::str::from_utf8(&node_binding.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // get native python binary path
+    let python_binding = Command::new("which")
+        .arg("python")
+        .output()
+        .context("Failed to run which")?;
+
+    let python_binary = std::str::from_utf8(&python_binding.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let run_binary_map: HashMap<String, String> =
+        [("node", node_binary), ("python", python_binary)]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.to_string()))
+            .collect();
+
+    let binding = Command::new("uname")
+        .arg("-s")
+        .output()
+        .context("Failed to run uname")?;
+
+    // get the operating system from the uname command
+    let operating_system = std::str::from_utf8(&binding.stdout);
+
+    let operating_system = match operating_system {
+        Ok("Darwin") => "macos",
+        Ok("Linux") => "linux",
+        _ => "unknown",
+    };
+
+    let executable_path = std::env::current_exe()
+        .context("Failed to get current executable path")?
+        .to_string_lossy()
+        .to_string();
+
+    // get the username from the USER environment variable
+    let username = std::env::var("USER").context("Failed to get username")?;
+
+    let machine_config = MachineConfig {
+        operating_system: operating_system.to_string(),
+        executable_path,
+        username,
+        run_binary_map,
+    };
+
     let daemon_info = DaemonInfo {
         started_at: Local::now(),
     };
@@ -613,7 +793,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (db, scheduler) = initialize()?;
+    let (db, scheduler) = initialize(machine_config.clone())?;
 
     if matches.subcommand_matches("daemon").is_some() {
         daemonize()?;
@@ -623,11 +803,17 @@ fn main() -> Result<()> {
     let runtime = Runtime::new()?;
     // we defer to the tokio runtime to the bottom of the main function rather
     // than with a macro to ensure that the daemonize function is called first
-    runtime.block_on(async { start_server_and_scheduler(db, scheduler, daemon_info).await })
+    runtime.block_on(async {
+        start_server_and_scheduler(machine_config, db, scheduler, daemon_info).await
+    })
 }
 
 #[instrument(skip(db, scheduler))]
-fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Mutex<Scheduler>>) -> Result<()> {
+fn hydrate_scheduler(
+    machine_config: MachineConfig,
+    db: &Arc<Mutex<Database>>,
+    scheduler: &Arc<Mutex<Scheduler>>,
+) -> Result<()> {
     let db_guard = db.lock().unwrap();
     let read_txn = db_guard
         .begin_read()
@@ -670,7 +856,7 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Mutex<Scheduler>
 
         match serde_yaml::from_str(yaml_content.value()) {
             Ok(config) => {
-                let workflow = WorkflowJob::new(config, namespace_obj);
+                let workflow = WorkflowJob::new(config, machine_config.clone(), namespace_obj);
                 scheduler.add(namespace, Box::new(workflow));
                 hydrated_jobs += 1;
                 info!(namespace, name, "Hydrated workflow");
@@ -692,6 +878,7 @@ fn hydrate_scheduler(db: &Arc<Mutex<Database>>, scheduler: &Arc<Mutex<Scheduler>
 
 #[instrument(skip(db, scheduler))]
 async fn start_server_and_scheduler(
+    machine_config: MachineConfig,
     db: Arc<Mutex<Database>>,
     scheduler: Arc<Mutex<Scheduler>>,
     daemon_info: DaemonInfo,
@@ -707,7 +894,11 @@ async fn start_server_and_scheduler(
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(addr.clone())?;
     info!(address = %addr, "Server started");
-
+    info!(
+        node = machine_config.run_binary_map.get("node"),
+        python = machine_config.run_binary_map.get("python"),
+        "Native binaries"
+    );
     {
         // ensure the NAMESPACES table and WORKFLOWS table exist (write dummy data; key, value)
         let db = db.lock().unwrap();
@@ -732,9 +923,10 @@ async fn start_server_and_scheduler(
         info!(client_addr = %addr, "New client connected");
         let db = Arc::clone(&db);
         let scheduler = Arc::clone(&scheduler);
+        let machine_clone = machine_config.clone();
         tokio::spawn(async move {
             info!(client_addr = %addr, "Handling client");
-            if let Err(e) = handle_client(stream, db, scheduler, daemon_info).await {
+            if let Err(e) = handle_client(machine_clone, stream, db, scheduler, daemon_info).await {
                 error!(client_addr = %addr, error = %e, "Error handling client");
             }
         });
@@ -824,6 +1016,7 @@ async fn list_namespaces(db: &Arc<Mutex<Database>>) -> Result<ListNamespaceRespo
 
 #[instrument(skip(db, scheduler))]
 async fn add_workflow(
+    machine_config: MachineConfig,
     namespace: &str,
     name: &str,
     yaml_content: &str,
@@ -864,7 +1057,7 @@ async fn add_workflow(
         serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace data")?;
 
     let mut scheduler = scheduler.lock().unwrap();
-    let workflow = WorkflowJob::new(config, namespace_obj);
+    let workflow = WorkflowJob::new(config, machine_config, namespace_obj);
     scheduler.add(namespace, Box::new(workflow));
     drop(scheduler);
 
@@ -880,6 +1073,7 @@ struct RegisterWorkflowsFromDirResponse {
 
 #[instrument(skip(db, scheduler))]
 async fn register_workflows_from_dir(
+    machine_config: MachineConfig,
     namespace: &str,
     dir_path: &str,
     db: &Arc<Mutex<Database>>,
@@ -939,24 +1133,113 @@ async fn register_workflows_from_dir(
             let file_name = entry.file_name().to_string_lossy();
             let workflow_name = file_name.trim_end_matches(".yaml").trim_end_matches(".yml");
             let yaml_content = tokio::fs::read_to_string(entry.path()).await?;
-
-            if let Ok(_config) = serde_yaml::from_str::<WorkflowYaml>(&yaml_content) {
-                add_workflow(
-                    namespace,
-                    workflow_name,
-                    &yaml_content,
-                    db,
-                    Arc::clone(&scheduler),
-                )
-                .await?;
-                registered += 1;
-            } else {
-                warn!(file = %entry.path().display(), "Failed to parse workflow config");
+            match serde_yaml::from_str::<WorkflowYaml>(&yaml_content) {
+                Ok(_config) => {
+                    add_workflow(
+                        machine_config.clone(),
+                        namespace,
+                        workflow_name,
+                        &yaml_content,
+                        db,
+                        Arc::clone(&scheduler),
+                    )
+                    .await?;
+                    registered += 1;
+                }
+                Err(e) => {
+                    warn!(file = %entry.path().display(), error = %e, "Failed to parse workflow config");
+                }
             }
         }
     }
 
     let response = RegisterWorkflowsFromDirResponse { registered };
+    Ok(response)
+}
+
+#[derive(Debug, Serialize)]
+struct UnregisterWorkflowsFromDirResponse {
+    unregistered: usize,
+}
+
+#[instrument(skip(db, scheduler))]
+async fn unregister_workflows_from_dir(
+    namespace: &str,
+    dir_path: &str,
+    db: &Arc<Mutex<Database>>,
+    scheduler: Arc<Mutex<Scheduler>>,
+) -> Result<UnregisterWorkflowsFromDirResponse> {
+    let mut unregistered = 0;
+
+    let namespace_path = PathBuf::from(dir_path);
+    let workspace_path = namespace_path.join(".jikan").join("workflows");
+
+    // ensure the directory exists
+    if !workspace_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Directory not found: {}",
+            workspace_path.display()
+        ));
+    }
+
+    if workspace_path.is_relative() {
+        return Err(anyhow::anyhow!(
+            "Invalid directory path. Please provide an absolute path."
+        ));
+    }
+
+    {
+        // remove the namespace from the database
+        let db = db.lock().unwrap();
+        let write_txn = db
+            .begin_write()
+            .context("Failed to begin write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(NAMESPACES)
+                .context("Failed to open namespaces table")?;
+            table
+                .remove(namespace)
+                .context("Failed to remove namespace")?;
+        }
+        write_txn.commit().context("Failed to commit transaction")?;
+    }
+
+    for entry in WalkDir::new(workspace_path.clone())
+        .follow_links(true)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .map_or(false, |ext| ext == "yaml" || ext == "yml")
+        {
+            let file_name = entry.file_name().to_string_lossy();
+            let workflow_name = file_name.trim_end_matches(".yaml").trim_end_matches(".yml");
+
+            let db = db.lock().unwrap();
+            let write_txn = db
+                .begin_write()
+                .context("Failed to begin write transaction")?;
+            {
+                let mut table = write_txn
+                    .open_table(WORKFLOWS)
+                    .context("Failed to open workflows table")?;
+                table
+                    .remove((namespace, workflow_name))
+                    .context("Failed to remove workflow")?;
+            }
+            write_txn.commit().context("Failed to commit transaction")?;
+
+            let scheduler = scheduler.lock().unwrap();
+            scheduler.remove(namespace, workflow_name);
+            unregistered += 1;
+        }
+    }
+
+    let response = UnregisterWorkflowsFromDirResponse { unregistered };
     Ok(response)
 }
 
@@ -985,12 +1268,15 @@ async fn run_workflow(
     // convert the run data to a HashMap<String, String> its in key=value,key=value format
     let run_data: HashMap<String, String> = run_data_str
         .split(',')
-        .map(|pair| {
+        .filter_map(|pair| {
             let mut split = pair.split('=');
-            (
-                split.next().unwrap_or("").to_string(),
-                split.next().unwrap_or("").to_string(),
-            )
+            let key = split.next().unwrap_or("").to_string();
+            let value = split.next().unwrap_or("").to_string();
+            if key.is_empty() {
+                None
+            } else {
+                Some((key, value))
+            }
         })
         .collect();
 
@@ -1076,6 +1362,7 @@ struct ListWorkflowsResponse {
 
 #[instrument(skip(db))]
 async fn list_workflows(
+    machine_config: MachineConfig,
     namespace: Option<&str>,
     db: &Arc<Mutex<Database>>,
 ) -> Result<Vec<ListWorkflowsResponse>> {
@@ -1092,11 +1379,11 @@ async fn list_workflows(
     for result in table.iter().context("Failed to iterate over workflows")? {
         let (key, workflow) = result.context("Failed to read workflow entry")?;
         let (ns, name) = key.value();
-        let wk = serde_yaml::from_str::<WorkflowYaml>(workflow.value())
+        let config = serde_yaml::from_str::<WorkflowYaml>(workflow.value())
             .context("Failed to parse workflow YAML")?;
 
         let empty_namespace = Namespace::new(String::new(), PathBuf::new());
-        let workflow = WorkflowJob::new(wk, empty_namespace);
+        let workflow = WorkflowJob::new(config, machine_config.clone(), empty_namespace);
         let crons = workflow.crons();
 
         if namespace.is_none() || namespace == Some(ns) {
@@ -1243,6 +1530,7 @@ struct GetNextRunResponse {
 
 #[instrument]
 async fn get_next_run_workflow(
+    machine_config: MachineConfig,
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
@@ -1274,7 +1562,7 @@ async fn get_next_run_workflow(
         let namespace_obj: Namespace =
             serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace")?;
 
-        let job = WorkflowJob::new(config, namespace_obj);
+        let job = WorkflowJob::new(config, machine_config, namespace_obj);
         let crons = job.crons();
 
         let mut next_runs = get_next_runs(crons, namespace, name, 1);
@@ -1299,10 +1587,10 @@ async fn get_next_run_workflow(
             };
             for (cron_str, next_time, seconds) in next_runs.clone() {
                 response.next_runs.push(format!(
-                    "{} In {} seconds ({})",
+                    "{} {} (in {} seconds)",
                     cron_str,
-                    seconds,
-                    next_time.to_rfc2822()
+                    next_time.to_rfc2822(),
+                    seconds
                 ));
             }
 
@@ -1338,6 +1626,7 @@ struct LastRunResponse {
 
 #[instrument]
 async fn get_last_run_workflow(
+    machine_config: MachineConfig,
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
@@ -1369,7 +1658,7 @@ async fn get_last_run_workflow(
         let namespace_obj: Namespace =
             serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace")?;
 
-        let _job = WorkflowJob::new(config, namespace_obj.clone());
+        let _job = WorkflowJob::new(config, machine_config, namespace_obj.clone());
 
         // get the logs from the last run using the directory path
         let logs_path = namespace_obj.path.join(".jikan").join("logs");
@@ -1447,7 +1736,7 @@ fn set_env(
                 .map_or(false, |wj| wj.config.name == name)
         }) {
             if let Some(workflow_job) = job.downcast_ref_to_workflow_job() {
-                workflow_job.set_env(key.to_string(), value.to_string());
+                workflow_job.set_env(key, value);
                 Ok(SetEnvResponse {
                     message: format!(
                         "Environment variable '{key}' set to '{value}' for workflow '{name}' in namespace '{namespace}'.\n",
@@ -1579,6 +1868,7 @@ fn serialize_response<T: Serialize>(response: T) -> Result<String> {
 
 #[instrument(skip(stream, db, scheduler), fields(client_addr = %stream.peer_addr().unwrap()))]
 async fn handle_client(
+    machine_config: MachineConfig,
     stream: TcpStream,
     db: Arc<Mutex<Database>>,
     scheduler: Arc<Mutex<Scheduler>>,
@@ -1595,13 +1885,12 @@ async fn handle_client(
     let response = match line.split_whitespace().collect::<Vec<&str>>().as_slice() {
         ["DAEMON_INFO"] => serialize_response(get_daemon_info(daemon_info).await?)?,
         ["LIST_NAMESPACES"] => serialize_response(list_namespaces(&db).await?)?,
-        ["REGISTER_DIR", namespace, dir_path] => {
-            serialize_response(register_workflows_from_dir(namespace, dir_path, &db, scheduler).await?)?
-        }
-        ["NEXT", namespace, name] => serialize_response(get_next_run_workflow(namespace, name, &db).await?)?,
-        ["LAST", namespace, name] => serialize_response(get_last_run_workflow(namespace, name, &db).await?)?,
-        ["LIST"] => serialize_response(list_workflows(None, &db).await?)?,
-        ["LIST", namespace] => serialize_response(list_workflows(Some(namespace), &db).await?)?,
+        ["REGISTER_DIR", namespace, dir_path] => serialize_response(register_workflows_from_dir(machine_config, namespace, dir_path, &db, scheduler).await?)?,
+        ["UNREGISTER_DIR", namespace, dir_path] => serialize_response(unregister_workflows_from_dir(namespace, dir_path, &db, scheduler).await?)?,
+        ["NEXT", namespace, name] => serialize_response(get_next_run_workflow(machine_config, namespace, name, &db).await?)?,
+        ["LAST", namespace, name] => serialize_response(get_last_run_workflow(machine_config, namespace, name, &db).await?)?,
+        ["LIST"] => serialize_response(list_workflows(machine_config, None, &db).await?)?,
+        ["LIST", namespace] => serialize_response(list_workflows(machine_config, Some(namespace), &db).await?)?,
         ["GET", namespace, name] => serialize_response(get_workflow(namespace, name, &db).await?)?,
         ["RUN", namespace, name] => serialize_response(run_workflow(namespace, name, &db, scheduler, "").await?)?,
         ["RUN", namespace, name, run_data] => {

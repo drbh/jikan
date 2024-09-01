@@ -1,0 +1,28 @@
+name: composer
+on:
+  schedule:
+    - cron: "0 0 * * * * *"
+
+jobs:
+  example-job:
+    # its bash, but its should be the machine
+    runs-on: machine 
+    steps:
+
+      # use the node powered action
+      - name: Uses test step
+        uses: actions/demo
+        with:
+          who-to-greet: 'drbh, Im a Node.js action 🤖'
+
+      # `time` gets set as an environment variable by the `actions/demo` action
+      - run: echo $time
+
+      # use the python powered action
+      - name: Uses test step
+        uses: actions/pydemo
+        with:
+          who-to-greet: 'drbh, Im a Python action 🐍'
+
+      # `time` gets set as an environment variable by the `actions/pydemo` action
+      - run: echo $time
