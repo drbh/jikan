@@ -1,0 +1,102 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    branches:
+      - main  
+
+jobs:
+  build_and_release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: Install cross
+      run: cargo install cross
+
+    - name: Build for Linux (x86_64)
+      run: |
+        cross build --release --target x86_64-unknown-linux-gnu --bin jikand
+        cross build --release --target x86_64-unknown-linux-gnu --bin jk
+
+    - name: Build for macOS (x86_64)
+      run: |
+        cross build --release --target x86_64-apple-darwin --bin jikand
+        cross build --release --target x86_64-apple-darwin --bin jk
+
+    - name: Build for macOS (ARM)
+      run: |
+        cross build --release --target aarch64-apple-darwin --bin jikand
+        cross build --release --target aarch64-apple-darwin --bin jk
+
+    - name: Get Version
+      id: get_version
+      run: |
+        version=$(grep '^version =' Cargo.toml | cut -d '"' -f 2)
+        echo "version=$version" >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      with:
+        tag_name: v${{ steps.get_version.outputs.version }}
+        release_name: Release v${{ steps.get_version.outputs.version }}
+        draft: false
+        prerelease: false
+
+    - name: Upload Linux Binaries
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./target/x86_64-unknown-linux-gnu/release/jikand
+        asset_name: jikand-linux-x86_64
+        asset_content_type: application/octet-stream
+
+    - name: Upload macOS (x86_64) Binaries
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./target/x86_64-apple-darwin/release/jikand
+        asset_name: jikand-macos-x86_64
+        asset_content_type: application/octet-stream
+
+    - name: Upload macOS (ARM) Binaries
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./target/aarch64-apple-darwin/release/jikand
+        asset_name: jikand-macos-arm64
+        asset_content_type: application/octet-stream
+
+    - name: Upload Linux jk Binary
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./target/x86_64-unknown-linux-gnu/release/jk
+        asset_name: jk-linux-x86_64
+        asset_content_type: application/octet-stream
+
+    - name: Upload macOS (x86_64) jk Binary
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./target/x86_64-apple-darwin/release/jk
+        asset_name: jk-macos-x86_64
+        asset_content_type: application/octet-stream
+
+    - name: Upload macOS (ARM) jk Binary
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./target/aarch64-apple-darwin/release/jk
+        asset_name: jk-macos-arm64
+        asset_content_type: application/octet-stream
