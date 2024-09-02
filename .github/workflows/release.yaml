@@ -94,6 +94,15 @@ jobs:
           cargo build --release --target ${{ matrix.target }} --bin jikand
           cargo build --release --target ${{ matrix.target }} --bin jk
 
+      - name: Generate checksum
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            sha256sum jikand jk > checksum-${{ matrix.name }}.txt
+          else
+            shasum -a 256 jikand jk > checksum-${{ matrix.name }}.txt
+          fi
+
       - name: Upload Release Asset (jikand)
         uses: actions/upload-release-asset@v1
         env:
@@ -103,6 +112,7 @@ jobs:
           asset_path: ./target/${{ matrix.target }}/release/jikand
           asset_name: jikand-${{ matrix.name }}
           asset_content_type: application/octet-stream
+        continue-on-error: true
 
       - name: Upload Release Asset (jk)
         uses: actions/upload-release-asset@v1
@@ -113,11 +123,7 @@ jobs:
           asset_path: ./target/${{ matrix.target }}/release/jk
           asset_name: jk-${{ matrix.name }}
           asset_content_type: application/octet-stream
-
-      - name: Generate checksum
-        run: |
-          cd target/${{ matrix.target }}/release
-          sha256sum jikand jk > checksum-${{ matrix.name }}.txt
+        continue-on-error: true
 
       - name: Upload checksum
         uses: actions/upload-release-asset@v1
@@ -128,3 +134,4 @@ jobs:
           asset_path: ./target/${{ matrix.target }}/release/checksum-${{ matrix.name }}.txt
           asset_name: checksum-${{ matrix.name }}.txt
           asset_content_type: text/plain
+        continue-on-error: true
