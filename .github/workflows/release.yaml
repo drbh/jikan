@@ -6,8 +6,35 @@ on:
       - main
 
 jobs:
-  build_and_release:
-    name: Build and Release
+  create_release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Get Version
+        id: get_version
+        run: |
+          version=$(grep '^version =' Cargo.toml | cut -d '"' -f 2)
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          release_name: Release v${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+
+  build_and_upload:
+    name: Build and Upload
+    needs: create_release
     strategy:
       fail-fast: false
       matrix:
@@ -22,8 +49,6 @@ jobs:
             target: aarch64-apple-darwin
             name: macos-arm64
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v3
 
@@ -46,81 +71,44 @@ jobs:
           cargo build --release --target ${{ matrix.target }} --bin jikand
           cargo build --release --target ${{ matrix.target }} --bin jk
 
-      - name: Get Version
-        id: get_version
-        run: |
-          version=$(grep '^version =' Cargo.toml | cut -d '"' -f 2)
-          echo "version=$version" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ steps.get_version.outputs.version }}
-          release_name: Release v${{ steps.get_version.outputs.version }}
-          draft: false
-          prerelease: false
-        if: matrix.os == 'ubuntu-latest'
-
       - name: Prepare assets
         run: |
           mkdir -p release
           cp target/${{ matrix.target }}/release/jikand release/jikand-${{ matrix.name }}
           cp target/${{ matrix.target }}/release/jk release/jk-${{ matrix.name }}
 
-      - name: Upload Release Assets
+      - name: Upload Release Asset (jikand)
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
           asset_path: ./release/jikand-${{ matrix.name }}
           asset_name: jikand-${{ matrix.name }}
           asset_content_type: application/octet-stream
 
-      - name: Upload Release Assets (jk)
+      - name: Upload Release Asset (jk)
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
           asset_path: ./release/jk-${{ matrix.name }}
           asset_name: jk-${{ matrix.name }}
           asset_content_type: application/octet-stream
 
-  upload_checksums:
-    needs: build_and_release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v3
-        with:
-          path: artifacts
-
-      - name: Generate checksums
+      - name: Generate checksum
         run: |
-          cd artifacts
-          for file in */*; do
-            sha256sum "$file" >> ../SHA256SUMS
-          done
+          cd release
+          sha256sum jikand-${{ matrix.name }} jk-${{ matrix.name }} > checksum-${{ matrix.name }}.txt
           cd ..
 
-      - name: Get Release
-        id: get_release
-        uses: bruceadams/get-release@v1.3.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload checksums
+      - name: Upload checksum
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./SHA256SUMS
-          asset_name: SHA256SUMS
+          upload_url: ${{ needs.create_release.outputs.upload_url }}
+          asset_path: ./release/checksum-${{ matrix.name }}.txt
+          asset_name: checksum-${{ matrix.name }}.txt
           asset_content_type: text/plain
