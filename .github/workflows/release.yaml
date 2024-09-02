@@ -12,7 +12,7 @@ jobs:
     permissions:
       contents: write
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      upload_url: ${{ steps.get_upload_url.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
       - uses: actions/checkout@v3
@@ -50,12 +50,16 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Get existing release URL
-        if: steps.check_release.outputs.exists == 'true'
+      - name: Get upload URL
+        id: get_upload_url
         run: |
-          upload_url=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/${{ steps.check_release.outputs.release_id }}" \
-            | jq -r '.upload_url')
+          if [ "${{ steps.check_release.outputs.exists }}" == "true" ]; then
+            upload_url=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/${{ steps.check_release.outputs.release_id }}" \
+              | jq -r '.upload_url')
+          else
+            upload_url="${{ steps.create_release.outputs.upload_url }}"
+          fi
           echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
 
   build_and_upload:
