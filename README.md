@@ -23,10 +23,8 @@ Jikan is a lightweight workflow execution daemon inspired by GitHub Actions, off
 1. Clone the repository:
 
 ```bash
-# install the daemon
-cargo install --git https://github.com/drbh/jikan.git jikan
-# install the CLI
-cargo install --git https://github.com/drbh/jikan.git jk
+# install `jikand` and `jk` binaries (into ~/.local/bin)
+curl -fsSL https://raw.githubusercontent.com/drbh/jikan/main/install.sh | sh
 ```
 
 2. Start the Jikan daemon:
