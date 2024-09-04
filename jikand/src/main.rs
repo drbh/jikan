@@ -2,6 +2,7 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use cron::Schedule as CronSchedule;
 use daemonize::Daemonize;
+use dirs::home_dir;
 use minijinja::{context, Environment};
 use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
@@ -324,8 +325,13 @@ impl JobTrait for WorkflowJob {
 
                 if let Some(uses) = &step.uses {
                     info!(step = index, uses = uses, "Using action");
-                    let action_repo_name = uses.split('/').last().unwrap().to_string();
-                    let action_dir = working_dir.join("actions").join(action_repo_name);
+                    // prefer the global action directory over the local one
+                    let action_dir = home_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join(".jikan")
+                        .join("actions")
+                        .join(uses);
+
                     let action_yaml_path = action_dir.join("action.yaml");
                     let action_yaml = std::fs::read_to_string(action_yaml_path).unwrap();
                     let action_yaml: ActionYaml = serde_yaml::from_str(&action_yaml).unwrap();
@@ -404,7 +410,14 @@ impl JobTrait for WorkflowJob {
                 }
             }
 
-            let log_dir = working_dir.join(".jikan").join("logs").join(job_id.clone());
+            // save all logs to a file to the central log directory in ~/.jikan/logs/{namespace}/{job_id}/{job_name}.log
+            let log_dir = dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".jikan")
+                .join("logs")
+                .join(self.namespace.name.clone())
+                .join(job_id.clone());
+
             std::fs::create_dir_all(&log_dir).unwrap();
             let log_file = log_dir.join(format!("{job_name}.log"));
             logfiles.push(log_file.clone());
@@ -1661,7 +1674,11 @@ async fn get_last_run_workflow(
         let _job = WorkflowJob::new(config, machine_config, namespace_obj.clone());
 
         // get the logs from the last run using the directory path
-        let logs_path = namespace_obj.path.join(".jikan").join("logs");
+        let logs_path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".jikan")
+            .join("logs")
+            .join(namespace);
 
         // get a list of all of the directories in the last run directory
         let logs = std::fs::read_dir(logs_path.clone()).unwrap();
@@ -1862,6 +1879,158 @@ async fn get_daemon_info(daemon_info: DaemonInfo) -> Result<DaemonInfoResponse> 
     Ok(response)
 }
 
+#[derive(Debug, Serialize)]
+struct DetailedLogFileResponse {
+    file_name: String,
+    content: String,
+}
+
+#[instrument]
+async fn get_log_file(
+    namespace: &str,
+    run_id: &str,
+    job_name: Option<&str>,
+    db: &Arc<Mutex<Database>>,
+) -> Result<Vec<DetailedLogFileResponse>> {
+
+    let mut logs_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".jikan")
+        .join("logs")
+        .join(namespace)
+        .join(run_id);
+
+    if let Some(job_name) = job_name {
+        logs_path = logs_path.join(job_name);
+    }
+
+    let mut response = Vec::new();
+
+    // for each file in the directory, read the content and return it
+    let logs = std::fs::read_dir(logs_path.clone()).unwrap();
+    for log in logs {
+        let log = log.unwrap();
+        let log_path = log.path();
+        let log_content = std::fs::read_to_string(log_path).unwrap();
+
+        let resp = DetailedLogFileResponse {
+            file_name: log.file_name().into_string().unwrap(),
+            content: log_content,
+        };
+
+        response.push(resp);
+    }
+
+    Ok(response)
+}
+
+// get_log_timeline list all the the logs in the logs directory under the namespace
+#[derive(Debug, Serialize)]
+struct LogTimelineResponse {
+    namespace: String,
+    logs: Vec<String>,
+}
+
+#[instrument]
+fn get_log_timeline(namespace: &str) -> Result<LogTimelineResponse> {
+    let logs_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".jikan")
+        .join("logs")
+        .join(namespace);
+
+    let logs = std::fs::read_dir(logs_path.clone()).unwrap();
+    let mut logs_vec = Vec::new();
+
+    for log in logs {
+        let log = log.unwrap();
+        let name = log.file_name().into_string().unwrap();
+        logs_vec.push(name);
+    }
+
+    let response = LogTimelineResponse {
+        namespace: namespace.to_string(),
+        logs: logs_vec,
+    };
+
+    Ok(response)
+}
+
+use git2::Repository;
+
+#[derive(Debug, Serialize)]
+struct GitCloneResponse {
+    url: String,
+    target_path: String,
+    local_path: String,
+}
+
+enum ActionCloneTarget {
+    Path(String),
+    GitUrl(String),
+}
+
+fn git_clone_action(
+    url_or_path: &str,
+    target_path: &str,
+    action_id: &str,
+) -> Result<GitCloneResponse> {
+    let base_path = dirs::home_dir()
+        .context("Failed to get home directory")?
+        .join(".jikan/actions");
+
+    let action_clone_target = if url_or_path.starts_with("http") {
+        ActionCloneTarget::GitUrl(url_or_path.to_string())
+    } else {
+        ActionCloneTarget::Path(url_or_path.to_string())
+    };
+
+    let local_action_path = base_path.join(action_id);
+    std::fs::create_dir_all(&local_action_path)?;
+
+    // if its a git url, clone the repo to the local path if its a path, copy the contents to the local path
+    let (tmp_dir, local_target_path) = match action_clone_target {
+        ActionCloneTarget::Path(path) => {
+            let target_path = PathBuf::from(path);
+            (None, target_path)
+        }
+        ActionCloneTarget::GitUrl(url) => {
+            let tmp_dir = tempfile::tempdir()?;
+            let _ = Repository::clone(&url, tmp_dir.path())?;
+            let target_path_within_repo = tmp_dir.path().join(PathBuf::from(target_path));
+            (Some(tmp_dir), target_path_within_repo)
+        }
+    };
+
+    std::fs::create_dir_all(&local_action_path)?;
+
+    for entry in WalkDir::new(local_target_path.clone())
+        .follow_links(true)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let entry_path = entry.path();
+        let relative_path = entry_path.strip_prefix(local_target_path.clone())?;
+        let target_path = local_action_path.join(relative_path);
+        if entry_path.is_dir() {
+            std::fs::create_dir_all(target_path)?;
+        } else {
+            std::fs::copy(entry_path, target_path)?;
+        }
+    }
+
+    // if its a git url we need to close the temp dir
+    if let Some(tmp_dir) = tmp_dir {
+        tmp_dir.close()?;
+    }
+
+    Ok(GitCloneResponse {
+        url: url_or_path.to_string(),
+        target_path: target_path.to_string(),
+        local_path: local_action_path.to_string_lossy().to_string(),
+    })
+}
+
 fn serialize_response<T: Serialize>(response: T) -> Result<String> {
     serde_json::to_string(&response).context("Failed to serialize response")
 }
@@ -1881,8 +2050,8 @@ async fn handle_client(
     reader.read_line(&mut line).await?;
 
     debug!(command = %line.trim(), "Received command");
-
-    let response = match line.split_whitespace().collect::<Vec<&str>>().as_slice() {
+    let split_line = line.split_whitespace().collect::<Vec<&str>>();
+    let response = match split_line.as_slice() {
         ["DAEMON_INFO"] => serialize_response(get_daemon_info(daemon_info).await?)?,
         ["LIST_NAMESPACES"] => serialize_response(list_namespaces(&db).await?)?,
         ["REGISTER_DIR", namespace, dir_path] => serialize_response(register_workflows_from_dir(machine_config, namespace, dir_path, &db, scheduler).await?)?,
@@ -1901,6 +2070,18 @@ async fn handle_client(
         }
         ["GET_ENV", namespace, name, key] => serialize_response(get_env(namespace, name, key, &db, &scheduler)?)?,
         ["LIST_ENV", namespace, name] => serialize_response(list_env(namespace, name, &db, &scheduler)?)?,
+        ["GET_LOG", namespace, run_id, job_name] => {
+            serialize_response(get_log_file(namespace, run_id, Some(job_name), &db).await?)?
+        }
+        ["GET_LOG", namespace, run_id] => {
+            serialize_response(get_log_file(namespace, run_id, None, &db).await?)?
+        }
+        ["GET_LOG_TIMELINE", namespace] => {
+            serialize_response(get_log_timeline(namespace)?)?
+        }
+        ["CLONE", url, target_path, action_id] => {
+            serialize_response(git_clone_action(url, target_path, action_id)?)?
+        }
         _ => {
             warn!(command = %line.trim(), "Invalid command received");
             "Invalid command. Use ADD_NAMESPACE, LIST_NAMESPACES, REGISTER_DIR, ADD, LIST, GET, or DELETE.\n".to_string()
