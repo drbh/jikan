@@ -1,7 +1,7 @@
 use clap::{Arg, Command};
-use std::process::Command as ProcessCommand;
 use colored::Colorize;
 use serde_json::Value;
+use std::process::Command as ProcessCommand;
 
 fn format_json(json_str: &str, color: bool) -> String {
     let parsed: Value = serde_json::from_str(json_str).unwrap_or(Value::Null);
@@ -111,6 +111,11 @@ fn main() -> std::io::Result<()> {
                 .arg(Arg::new("name").required(true))
                 .arg(Arg::new("args").required(false)),
         )
+        .subcommand(
+            Command::new("exec")
+                .about("Execute a workflow")
+                .arg(Arg::new("file").required(true)),
+        )
         .subcommand(Command::new("list_namespaces").about("List namespaces"))
         .subcommand(
             Command::new("set_env")
@@ -170,6 +175,16 @@ fn main() -> std::io::Result<()> {
 
     let format_output = matches.get_flag("format");
 
+    // before we do anything, we need to check if the daemon is running
+    let output = ProcessCommand::new("sh")
+        .arg("-c")
+        .arg("nc -z localhost 8080")
+        .output()?;
+    if !output.status.success() {
+        eprintln!("Jikan daemon is not running. Please start the daemon before running commands.");
+        return Ok(());
+    }
+
     let command = match matches.subcommand() {
         Some(("list" | "ls", sub_m)) => {
             let namespace = sub_m
@@ -194,6 +209,12 @@ fn main() -> std::io::Result<()> {
             let (namespace, name) = split_namespace_and_name(name);
             let args = sub_m.get_one::<String>("args").map_or("", String::as_str);
             format!("RUN {namespace} {name} {args}")
+        }
+        Some(("exec", sub_m)) => {
+            let file = sub_m.get_one::<String>("file").unwrap();
+            // get current directory and prepend to file
+            let file = location_when_cli_is_run.join(file);
+            format!("EXEC {}", file.to_str().unwrap())
         }
         Some(("list_namespaces", _)) => "LIST_NAMESPACES".to_string(),
         Some(("daemon_info", _sub_m)) => "DAEMON_INFO".to_string(),

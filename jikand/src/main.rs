@@ -461,16 +461,21 @@ impl WorkflowJob {
     fn run_bash_external(&self, command: &str, working_dir: PathBuf) -> (String, bool) {
         info!("Executing bash command: {}", command);
         let context = self.context.read();
+        let mut command_builder = Command::new("/bin/bash");
 
-        let output = Command::new("/bin/bash")
+        let mut command_builder = command_builder
             .arg("-c")
             .arg(command)
-            .current_dir(working_dir)
             .env_clear()
             .envs(&context.env)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output();
+            .stderr(std::process::Stdio::piped());
+
+        if !working_dir.to_string_lossy().is_empty() {
+            command_builder = command_builder.current_dir(working_dir);
+        }
+
+        let output = command_builder.output();
 
         match output {
             Ok(output) => {
@@ -1364,6 +1369,37 @@ async fn run_workflow(
     }
 }
 
+// exec_workflow is like run but is ephemeral and does not save the results and uses a fileinput
+async fn exec_workflow(file_path: &str) -> Result<RunWorkflowResponse> {
+    // first read the workflow file
+    let yaml_content = tokio::fs::read_to_string(file_path).await?;
+
+    // parse the workflow yaml
+    let config: WorkflowYaml =
+        serde_yaml::from_str(&yaml_content).context("Failed to parse workflow YAML")?;
+
+    let machine_config = MachineConfig {
+        operating_system: "linux".to_string(),
+        executable_path: "/usr/bin/jikan".to_string(),
+        username: "jikan".to_string(),
+        run_binary_map: HashMap::new(),
+    };
+
+    let namespace = Namespace::new("default".to_string(), PathBuf::new());
+
+    let mut job = WorkflowJob::new(config, machine_config, namespace);
+
+    // run the job
+    let run_results = job
+        .run(RunEvent {
+            event: RunEventTypes::Manual,
+            data: HashMap::new(),
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to run workflow: {e}"))?;
+
+    Ok(RunWorkflowResponse { run_results })
+}
+
 #[derive(Debug, Serialize)]
 struct ListWorkflowsResponse {
     namespace: String,
@@ -1892,7 +1928,6 @@ async fn get_log_file(
     job_name: Option<&str>,
     db: &Arc<Mutex<Database>>,
 ) -> Result<Vec<DetailedLogFileResponse>> {
-
     let mut logs_path = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".jikan")
@@ -2065,6 +2100,7 @@ async fn handle_client(
         ["RUN", namespace, name, run_data] => {
             serialize_response(run_workflow(namespace, name, &db, scheduler, run_data).await?)?
         }
+        ["EXEC", filepath] => serialize_response(exec_workflow(filepath).await?)?,
         ["SET_ENV", namespace, name, key, value] => {
             serialize_response(set_env(namespace, name, key, value, &db, &scheduler)?)?
         }
