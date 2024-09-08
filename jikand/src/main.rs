@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::{
     fs::File,
     net::{TcpListener, TcpStream},
@@ -29,6 +30,131 @@ use walkdir::WalkDir;
 
 const WORKFLOWS: TableDefinition<(&str, &str), &str> = TableDefinition::new("workflows");
 const NAMESPACES: TableDefinition<&str, &str> = TableDefinition::new("namespaces");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStatus {
+    pub namespace: String,
+    pub name: String,
+    pub status: String,
+    pub message: String,
+    pub timestamp: usize,
+}
+
+pub struct StatusBroadcaster {
+    senders: Arc<Mutex<Vec<Sender<JobStatus>>>>,
+}
+
+impl Default for StatusBroadcaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatusBroadcaster {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            senders: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> Receiver<JobStatus> {
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut senders) = self.senders.lock() {
+            senders.push(tx);
+        }
+        rx
+    }
+
+    pub fn send(&self, status: &JobStatus) -> Result<()> {
+        if let Ok(senders) = self.senders.lock() {
+            senders.iter().for_each(|sender| {
+                if let Err(e) = sender.send(status.clone()) {
+                    warn!("Failed to send status: {}", e);
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for StatusBroadcaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatusBroadcaster").finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscriptionManager {
+    broadcaster: Arc<StatusBroadcaster>,
+    subscribers: Arc<RwLock<HashMap<String, Sender<JobStatus>>>>,
+}
+
+impl SubscriptionManager {
+    #[must_use]
+    pub fn new(broadcaster: Arc<StatusBroadcaster>) -> Self {
+        Self {
+            broadcaster,
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn add_subscriber(&self, id: &str, workflows: Vec<String>) -> Receiver<JobStatus> {
+        info!("Adding subscriber {}", id);
+        let (tx, rx) = mpsc::channel();
+        let mut subscribers = self.subscribers.write();
+        subscribers.insert(id.to_string(), tx.clone());
+
+        let broadcaster = self.broadcaster.clone();
+        let subscribers_clone = self.subscribers.clone();
+        let id_clone = id.to_string();
+
+        std::thread::spawn(move || {
+            let receiver = broadcaster.subscribe();
+            while let Ok(status) = receiver.recv() {
+                debug!("Received status for workflow: {}", status.name);
+                if workflows.is_empty() || workflows.contains(&status.name) {
+                    let subscribers = subscribers_clone.read();
+                    if let Some(tx) = subscribers.get(&id_clone) {
+                        if tx.send(status.clone()).is_err() {
+                            warn!("Failed to send status to subscriber {}", id_clone);
+                            break; // subscriber has disconnected
+                        }
+                    } else {
+                        warn!("Subscriber {} not found", id_clone);
+                        break; // subscriber has been removed
+                    }
+                }
+            }
+            // clean up the subscriber when the task ends
+            let mut subscribers = subscribers_clone.write();
+            subscribers.remove(&id_clone);
+            info!("Subscriber {} removed", id_clone);
+        });
+
+        rx
+    }
+
+    pub fn remove_subscriber(&self, id: &str) {
+        info!("Removing subscriber {}", id);
+        let mut subscribers = self.subscribers.write();
+        subscribers.remove(id);
+    }
+
+    pub fn send_event(&self, status: &JobStatus) -> Result<()> {
+        match self.broadcaster.send(status) {
+            Ok(()) => {
+                debug!("Event sent successfully");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to send event: {}", e);
+                Err(anyhow::anyhow!("Failed to send event: {}", e))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RunEventTypes {
@@ -105,7 +231,8 @@ pub struct WorkflowYaml {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct On {
-    schedule: Vec<Schedule>,
+    schedule: Option<Vec<Schedule>>,
+    workflow_dispatch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -205,15 +332,22 @@ struct WorkflowJob {
     machine_config: MachineConfig,
     context: Arc<RwLock<Context>>,
     namespace: Namespace,
+    subscription_manager: Arc<SubscriptionManager>,
 }
 
 impl WorkflowJob {
-    fn new(config: WorkflowYaml, machine_config: MachineConfig, namespace: Namespace) -> Self {
+    fn new(
+        config: WorkflowYaml,
+        machine_config: MachineConfig,
+        namespace: Namespace,
+        subscription_manager: Arc<SubscriptionManager>,
+    ) -> Self {
         Self {
             config,
             machine_config,
             context: Arc::new(RwLock::new(Context::new())),
             namespace,
+            subscription_manager,
         }
     }
 
@@ -244,6 +378,8 @@ impl JobTrait for WorkflowJob {
         self.config
             .on
             .schedule
+            .clone()
+            .unwrap_or_default()
             .iter()
             .map(|s| s.cron.clone())
             .collect()
@@ -256,6 +392,18 @@ impl JobTrait for WorkflowJob {
         let mut logfiles = vec![];
         let mut success = false;
         info!("Running workflow");
+
+        let job_status = JobStatus {
+            namespace: self.namespace.name.clone(),
+            name: self.config.name.clone(),
+            status: "in_progress".to_string(),
+            message: "Workflow started".to_string(),
+            timestamp: usize::try_from(Local::now().timestamp()).unwrap_or(0),
+        };
+
+        if let Err(e) = self.subscription_manager.send_event(&job_status) {
+            warn!("Failed to send start event: {}", e);
+        }
 
         let working_dir = self.namespace.path.clone();
         info!(working_dir = %working_dir.display(), "Setting working directory");
@@ -272,6 +420,18 @@ impl JobTrait for WorkflowJob {
 
         for (job_name, job) in &self.config.jobs.job_map {
             info!(job_name = %job_name, "Starting job");
+
+            let job_status = JobStatus {
+                namespace: self.namespace.name.clone(),
+                name: job_name.clone(),
+                status: "in_progress".to_string(),
+                message: "Job started".to_string(),
+                timestamp: usize::try_from(Local::now().timestamp()).unwrap_or(0),
+            };
+
+            if let Err(e) = self.subscription_manager.send_event(&job_status) {
+                warn!("Failed to send start event: {}", e);
+            }
 
             // evaluate the job condition
             if let Some(condition) = &job.condition {
@@ -297,6 +457,18 @@ impl JobTrait for WorkflowJob {
             for (index, step) in job.steps.iter().enumerate() {
                 if let Some(run) = &step.run {
                     info!(step = index, command = run, "Executing step");
+
+                    let job_status = JobStatus {
+                        namespace: self.namespace.name.clone(),
+                        name: job_name.clone(),
+                        status: "in_progress".to_string(),
+                        message: format!("Step {index} started"),
+                        timestamp: usize::try_from(Local::now().timestamp()).unwrap_or(0),
+                    };
+
+                    if let Err(e) = self.subscription_manager.send_event(&job_status) {
+                        warn!("Failed to send start event: {}", e);
+                    }
 
                     // if valid filepath read the contents as a string
                     let possible_path = working_dir.clone().join(run);
@@ -424,6 +596,18 @@ impl JobTrait for WorkflowJob {
             std::fs::write(log_file, job_logs).unwrap();
 
             info!(job_name = %job_name, "Job completed");
+        }
+
+        let job_status = JobStatus {
+            namespace: self.namespace.name.clone(),
+            name: self.config.name.clone(),
+            status: if success { "success" } else { "failure" }.to_string(),
+            message: "Workflow completed".to_string(),
+            timestamp: usize::try_from(Local::now().timestamp()).unwrap_or(0),
+        };
+
+        if let Err(e) = self.subscription_manager.send_event(&job_status) {
+            warn!("Failed to send end event: {}", e);
         }
 
         info!("Workflow completed");
@@ -667,7 +851,11 @@ fn run_forever(scheduler: Arc<Mutex<Scheduler>>) {
     });
 }
 
-type AppData = (Arc<Mutex<Database>>, Arc<Mutex<Scheduler>>);
+type AppData = (
+    Arc<Mutex<Database>>,
+    Arc<Mutex<Scheduler>>,
+    Arc<SubscriptionManager>,
+);
 
 fn initialize(machine_config: MachineConfig) -> Result<AppData> {
     tracing_subscriber::registry()
@@ -693,15 +881,17 @@ fn initialize(machine_config: MachineConfig) -> Result<AppData> {
     ));
 
     let scheduler = Arc::new(Mutex::new(Scheduler::new()));
+    let broadcaster = Arc::new(StatusBroadcaster::new());
+    let subscription_manager = Arc::new(SubscriptionManager::new(broadcaster.clone()));
 
-    match hydrate_scheduler(machine_config, &db, &scheduler) {
+    match hydrate_scheduler(machine_config, &db, &scheduler, &subscription_manager) {
         Ok(()) => {}
         Err(e) => {
             warn!(error = %e, "Failed to hydrate scheduler");
         }
     }
 
-    Ok((db, scheduler))
+    Ok((db, scheduler, subscription_manager))
 }
 
 fn daemonize() -> Result<()> {
@@ -811,7 +1001,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (db, scheduler) = initialize(machine_config.clone())?;
+    let (db, scheduler, subscription_manager) = initialize(machine_config.clone())?;
 
     if matches.subcommand_matches("daemon").is_some() {
         daemonize()?;
@@ -822,7 +1012,14 @@ fn main() -> Result<()> {
     // we defer to the tokio runtime to the bottom of the main function rather
     // than with a macro to ensure that the daemonize function is called first
     runtime.block_on(async {
-        start_server_and_scheduler(machine_config, db, scheduler, daemon_info).await
+        start_server_and_scheduler(
+            machine_config,
+            db,
+            scheduler,
+            subscription_manager,
+            daemon_info,
+        )
+        .await
     })
 }
 
@@ -831,6 +1028,7 @@ fn hydrate_scheduler(
     machine_config: MachineConfig,
     db: &Arc<Mutex<Database>>,
     scheduler: &Arc<Mutex<Scheduler>>,
+    subscription_manager: &Arc<SubscriptionManager>,
 ) -> Result<()> {
     let db_guard = db.lock().unwrap();
     let read_txn = db_guard
@@ -874,7 +1072,12 @@ fn hydrate_scheduler(
 
         match serde_yaml::from_str(yaml_content.value()) {
             Ok(config) => {
-                let workflow = WorkflowJob::new(config, machine_config.clone(), namespace_obj);
+                let workflow = WorkflowJob::new(
+                    config,
+                    machine_config.clone(),
+                    namespace_obj,
+                    subscription_manager.clone(),
+                );
                 scheduler.add(namespace, Box::new(workflow));
                 hydrated_jobs += 1;
                 info!(namespace, name, "Hydrated workflow");
@@ -894,11 +1097,12 @@ fn hydrate_scheduler(
     Ok(())
 }
 
-#[instrument(skip(db, scheduler))]
+#[instrument(skip(db, scheduler, subscription_manager))]
 async fn start_server_and_scheduler(
     machine_config: MachineConfig,
     db: Arc<Mutex<Database>>,
     scheduler: Arc<Mutex<Scheduler>>,
+    subscription_manager: Arc<SubscriptionManager>,
     daemon_info: DaemonInfo,
 ) -> Result<()> {
     // start the scheduler
@@ -941,10 +1145,20 @@ async fn start_server_and_scheduler(
         info!(client_addr = %addr, "New client connected");
         let db = Arc::clone(&db);
         let scheduler = Arc::clone(&scheduler);
+        let subscription_manager = Arc::clone(&subscription_manager);
         let machine_clone = machine_config.clone();
         tokio::spawn(async move {
             info!(client_addr = %addr, "Handling client");
-            if let Err(e) = handle_client(machine_clone, stream, db, scheduler, daemon_info).await {
+            if let Err(e) = handle_client(
+                machine_clone,
+                stream,
+                db,
+                scheduler,
+                subscription_manager,
+                daemon_info,
+            )
+            .await
+            {
                 error!(client_addr = %addr, error = %e, "Error handling client");
             }
         });
@@ -1040,6 +1254,7 @@ async fn add_workflow(
     yaml_content: &str,
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Mutex<Scheduler>>,
+    subscription_manager: Arc<SubscriptionManager>,
 ) -> Result<String> {
     let config: WorkflowYaml =
         serde_yaml::from_str(yaml_content).context("Failed to parse workflow YAML")?;
@@ -1075,7 +1290,7 @@ async fn add_workflow(
         serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace data")?;
 
     let mut scheduler = scheduler.lock().unwrap();
-    let workflow = WorkflowJob::new(config, machine_config, namespace_obj);
+    let workflow = WorkflowJob::new(config, machine_config, namespace_obj, subscription_manager);
     scheduler.add(namespace, Box::new(workflow));
     drop(scheduler);
 
@@ -1096,6 +1311,7 @@ async fn register_workflows_from_dir(
     dir_path: &str,
     db: &Arc<Mutex<Database>>,
     scheduler: Arc<Mutex<Scheduler>>,
+    subscription_manager: Arc<SubscriptionManager>,
 ) -> Result<RegisterWorkflowsFromDirResponse> {
     let mut registered = 0;
 
@@ -1160,6 +1376,7 @@ async fn register_workflows_from_dir(
                         &yaml_content,
                         db,
                         Arc::clone(&scheduler),
+                        subscription_manager.clone(),
                     )
                     .await?;
                     registered += 1;
@@ -1370,7 +1587,10 @@ async fn run_workflow(
 }
 
 // exec_workflow is like run but is ephemeral and does not save the results and uses a fileinput
-async fn exec_workflow(file_path: &str) -> Result<RunWorkflowResponse> {
+async fn exec_workflow(
+    file_path: &str,
+    subscription_manager: Arc<SubscriptionManager>,
+) -> Result<RunWorkflowResponse> {
     // first read the workflow file
     let yaml_content = tokio::fs::read_to_string(file_path).await?;
 
@@ -1387,7 +1607,7 @@ async fn exec_workflow(file_path: &str) -> Result<RunWorkflowResponse> {
 
     let namespace = Namespace::new("default".to_string(), PathBuf::new());
 
-    let mut job = WorkflowJob::new(config, machine_config, namespace);
+    let mut job = WorkflowJob::new(config, machine_config, namespace, subscription_manager);
 
     // run the job
     let run_results = job
@@ -1414,6 +1634,7 @@ async fn list_workflows(
     machine_config: MachineConfig,
     namespace: Option<&str>,
     db: &Arc<Mutex<Database>>,
+    subscription_manager: Arc<SubscriptionManager>,
 ) -> Result<Vec<ListWorkflowsResponse>> {
     let db = db.lock().unwrap();
     let read_txn = db
@@ -1432,7 +1653,12 @@ async fn list_workflows(
             .context("Failed to parse workflow YAML")?;
 
         let empty_namespace = Namespace::new(String::new(), PathBuf::new());
-        let workflow = WorkflowJob::new(config, machine_config.clone(), empty_namespace);
+        let workflow = WorkflowJob::new(
+            config,
+            machine_config.clone(),
+            empty_namespace,
+            subscription_manager.clone(),
+        );
         let crons = workflow.crons();
 
         if namespace.is_none() || namespace == Some(ns) {
@@ -1583,6 +1809,7 @@ async fn get_next_run_workflow(
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
+    subscription_manager: Arc<SubscriptionManager>,
 ) -> Result<GetNextRunResponse> {
     let db = db.lock().unwrap();
     let read_txn = db
@@ -1611,7 +1838,7 @@ async fn get_next_run_workflow(
         let namespace_obj: Namespace =
             serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace")?;
 
-        let job = WorkflowJob::new(config, machine_config, namespace_obj);
+        let job = WorkflowJob::new(config, machine_config, namespace_obj, subscription_manager);
         let crons = job.crons();
 
         let mut next_runs = get_next_runs(crons, namespace, name, 1);
@@ -1679,6 +1906,7 @@ async fn get_last_run_workflow(
     namespace: &str,
     name: &str,
     db: &Arc<Mutex<Database>>,
+    subscription_manager: Arc<SubscriptionManager>,
 ) -> Result<LastRunResponse> {
     let db = db.lock().unwrap();
     let read_txn = db
@@ -1707,7 +1935,12 @@ async fn get_last_run_workflow(
         let namespace_obj: Namespace =
             serde_json::from_str(namespace_entry.value()).context("Failed to parse namespace")?;
 
-        let _job = WorkflowJob::new(config, machine_config, namespace_obj.clone());
+        let _job = WorkflowJob::new(
+            config,
+            machine_config,
+            namespace_obj.clone(),
+            subscription_manager.clone(),
+        );
 
         // get the logs from the last run using the directory path
         let logs_path = dirs::home_dir()
@@ -2070,12 +2303,13 @@ fn serialize_response<T: Serialize>(response: T) -> Result<String> {
     serde_json::to_string(&response).context("Failed to serialize response")
 }
 
-#[instrument(skip(stream, db, scheduler), fields(client_addr = %stream.peer_addr().unwrap()))]
+#[instrument(skip(stream, db, scheduler, subscription_manager), fields(client_addr = %stream.peer_addr().unwrap()))]
 async fn handle_client(
     machine_config: MachineConfig,
     stream: TcpStream,
     db: Arc<Mutex<Database>>,
     scheduler: Arc<Mutex<Scheduler>>,
+    subscription_manager: Arc<SubscriptionManager>,
     daemon_info: DaemonInfo,
 ) -> Result<()> {
     let mut stream = TokioTcpStream::from_std(stream)?;
@@ -2086,21 +2320,58 @@ async fn handle_client(
 
     debug!(command = %line.trim(), "Received command");
     let split_line = line.split_whitespace().collect::<Vec<&str>>();
+
+    // handle long-lived interactions
+    let long_lived = match split_line.as_slice() {
+        ["SUBSCRIBE_STATUS"] | ["SUBSCRIBE_STATUS", ..] => {
+            let workflows_to_watch: Vec<String> =
+                split_line[1..].iter().map(|&s| s.to_string()).collect();
+            let subscriber_id = format!("{:?}", "david");
+            let receiver =
+                subscription_manager.add_subscriber(&subscriber_id, workflows_to_watch.clone());
+            Some((receiver, subscriber_id))
+        }
+        _ => None,
+    };
+    let subscription_manager = Arc::clone(&subscription_manager);
+
+    // long responses will keep the tcp connection open and send updates to the client
+    if let Some((receiver, subscriber_id)) = long_lived {
+        while let Ok(status) = receiver.recv() {
+            let status_json = serde_json::to_string(&status).unwrap();
+            if let Err(e) = writer.write_all(status_json.as_bytes()).await {
+                error!("Failed to send status update: {}", e);
+                break;
+            }
+            if let Err(e) = writer.write_all(b"\n").await {
+                error!("Failed to send newline: {}", e);
+                break;
+            }
+            if let Err(e) = writer.flush().await {
+                error!("Failed to flush writer: {}", e);
+                break;
+            }
+        }
+
+        subscription_manager.remove_subscriber(&subscriber_id);
+        return Ok(());
+    }
+
     let response = match split_line.as_slice() {
         ["DAEMON_INFO"] => serialize_response(get_daemon_info(daemon_info).await?)?,
         ["LIST_NAMESPACES"] => serialize_response(list_namespaces(&db).await?)?,
-        ["REGISTER_DIR", namespace, dir_path] => serialize_response(register_workflows_from_dir(machine_config, namespace, dir_path, &db, scheduler).await?)?,
+        ["REGISTER_DIR", namespace, dir_path] => serialize_response(register_workflows_from_dir(machine_config, namespace, dir_path, &db, scheduler, subscription_manager).await?)?,
         ["UNREGISTER_DIR", namespace, dir_path] => serialize_response(unregister_workflows_from_dir(namespace, dir_path, &db, scheduler).await?)?,
-        ["NEXT", namespace, name] => serialize_response(get_next_run_workflow(machine_config, namespace, name, &db).await?)?,
-        ["LAST", namespace, name] => serialize_response(get_last_run_workflow(machine_config, namespace, name, &db).await?)?,
-        ["LIST"] => serialize_response(list_workflows(machine_config, None, &db).await?)?,
-        ["LIST", namespace] => serialize_response(list_workflows(machine_config, Some(namespace), &db).await?)?,
+        ["NEXT", namespace, name] => serialize_response(get_next_run_workflow(machine_config, namespace, name, &db, subscription_manager).await?)?,
+        ["LAST", namespace, name] => serialize_response(get_last_run_workflow(machine_config, namespace, name, &db, subscription_manager).await?)?,
+        ["LIST"] => serialize_response(list_workflows(machine_config, None, &db, subscription_manager).await?)?,
+        ["LIST", namespace] => serialize_response(list_workflows(machine_config, Some(namespace), &db, subscription_manager).await?)?,
         ["GET", namespace, name] => serialize_response(get_workflow(namespace, name, &db).await?)?,
         ["RUN", namespace, name] => serialize_response(run_workflow(namespace, name, &db, scheduler, "").await?)?,
         ["RUN", namespace, name, run_data] => {
             serialize_response(run_workflow(namespace, name, &db, scheduler, run_data).await?)?
         }
-        ["EXEC", filepath] => serialize_response(exec_workflow(filepath).await?)?,
+        ["EXEC", filepath] => serialize_response(exec_workflow(filepath, subscription_manager).await?)?,
         ["SET_ENV", namespace, name, key, value] => {
             serialize_response(set_env(namespace, name, key, value, &db, &scheduler)?)?
         }
